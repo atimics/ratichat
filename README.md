@@ -1,5 +1,7 @@
 # 🤖 Chatbot System
 
+For Discord community chat, follow the [Discord setup guide](docs/DISCORD_SETUP.md).
+
 A sophisticated, context-aware chatbot system with dynamic tool-based architecture, multi-platform integration, and advanced conversation state management. Built for intelligent conversations across Matrix and Farcaster platforms with comprehensive AI-driven decision making.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
