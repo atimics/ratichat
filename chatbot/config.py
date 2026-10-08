@@ -51,7 +51,7 @@ class AppConfig(BaseSettings):
     LOG_LEVEL: str = "INFO"
     
     # Web Search and Research
-    WEB_SEARCH_MODEL: str = "openai/gpt-4o-mini:online"  # OpenRouter online model for web search
+    WEB_SEARCH_MODEL: str = "openai/gpt-4o-mini"  # OpenRouter model with the web search server tool
 
     # Matrix (Optional since we removed Synapse dependency)
     MATRIX_HOMESERVER: Optional[str] = None

@@ -42,17 +42,17 @@ async def get_world_state(orchestrator: MainOrchestrator = Depends(get_orchestra
         if hasattr(orchestrator.processing_hub, 'node_manager') and orchestrator.processing_hub.node_manager:
             node_manager = orchestrator.processing_hub.node_manager
             node_info = {
-                "expanded_nodes": list(node_manager.expanded_nodes.keys()),
-                "collapsed_summaries": list(node_manager.collapsed_node_summaries.keys()),
-                "pinned_nodes": list(node_manager.pinned_nodes),
-                "system_events": node_manager.get_system_events()[-10:],  # Last 10 events
+                "expanded_nodes": node_manager.get_expanded_nodes(),
+                "collapsed_summaries": [path for path, meta in node_manager.node_metadata.items() if not meta.is_expanded],
+                "pinned_nodes": [path for path, meta in node_manager.node_metadata.items() if meta.is_pinned],
+                "system_events": [event.to_dict() for event in node_manager.system_events][-10:],
                 "expansion_status": node_manager.get_expansion_status_summary()
             }
         
         return {
             "traditional_state": state_dict,
             "node_state": node_info,
-            "processing_mode": "node_based" if orchestrator.config.processing_config.enable_node_based_processing else "traditional",
+            "processing_mode": orchestrator.processing_hub.get_processing_status()["current_mode"],
             "timestamp": datetime.now().isoformat()
         }
     except Exception:
@@ -97,6 +97,10 @@ async def get_channels(orchestrator: MainOrchestrator = Depends(get_orchestrator
 async def get_ai_world_state_payload(orchestrator: MainOrchestrator = Depends(get_orchestrator)):
     """Get the actual world state payload as used by the AI system."""
     try:
+        processor = orchestrator.processing_hub.node_processor
+        if processor and orchestrator.processing_hub.current_processing_mode == "node_based":
+            return {"ai_world_state": processor.last_payload or {},
+                    "metadata": {"payload_type": "node_based", "timestamp": datetime.now().isoformat()}}
         # Get the payload builder from the orchestrator
         payload_builder = orchestrator.payload_builder
         world_state_data = orchestrator.world_state.state
@@ -144,29 +148,11 @@ async def execute_node_action(
         if not hasattr(orchestrator.processing_hub, 'node_manager') or not orchestrator.processing_hub.node_manager:
             raise HTTPException(status_code=400, detail="Node-based processing not available")
         
-        node_manager = orchestrator.processing_hub.node_manager
-        
-        if action.action == "expand":
-            await node_manager.expand_node(action.node_id, force=action.force)
-        elif action.action == "collapse":
-            await node_manager.collapse_node(action.node_id)
-        elif action.action == "pin":
-            node_manager.pin_node(action.node_id)
-        elif action.action == "unpin":
-            node_manager.unpin_node(action.node_id)
-        elif action.action == "refresh_summary":
-            # This would trigger the NodeSummaryService to refresh the summary
-            if hasattr(orchestrator.processing_hub, 'node_summary_service'):
-                await orchestrator.processing_hub.node_summary_service.refresh_summary(action.node_id)
-        else:
+        if action.action not in {"expand", "collapse", "pin", "unpin"}:
             raise HTTPException(status_code=400, detail=f"Unknown action: {action.action}")
-        
-        return {
-            "success": True,
-            "action": action.action,
-            "node_id": action.node_id,
-            "message": f"Action '{action.action}' executed on node '{action.node_id}'"
-        }
+        return orchestrator.processing_hub.node_processor.execute_node_action(
+            action.action + "_node", {"node_path": action.node_id},
+        )
     except HTTPException:
         raise
     except Exception:

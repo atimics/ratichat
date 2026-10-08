@@ -429,6 +429,7 @@ class MainOrchestrator:
             arweave_client=self.arweave_client,
             arweave_service=arweave_service_instance
         )
+        self.action_context.ai_engine = self.ai_engine
         from ...integrations.matrix.steward import MatrixSteward
         self.matrix_steward = MatrixSteward(settings, self.config.db_path)
         self.action_context.matrix_steward = self.matrix_steward
@@ -501,7 +502,7 @@ class MainOrchestrator:
             _has_media_tools = False
             logger.warning("Media generation tools unavailable — skipping")
         from ...tools.permaweb_tools import StorePermanentMemoryTool
-        from ...tools.web_tools import WebSearchTool
+        from ...tools.web_tools import WebSearchTool, ReadWebpageTool, ReadFeedTool
         from ...tools.research_tools import UpdateResearchTool, QueryResearchTool
         from ...tools.developer_tools import (
             GetGitHubIssuesTool, GetGitHubIssueDetailsTool, CommentOnGitHubIssueTool,
@@ -531,6 +532,8 @@ class MainOrchestrator:
         
         # Web search and research tools
         self.tool_registry.register_tool(WebSearchTool())
+        self.tool_registry.register_tool(ReadWebpageTool())
+        self.tool_registry.register_tool(ReadFeedTool())
         self.tool_registry.register_tool(UpdateResearchTool())
         self.tool_registry.register_tool(QueryResearchTool())
         
@@ -720,8 +723,11 @@ class MainOrchestrator:
         
         self.processing_hub.set_traditional_processor(traditional_processor)
         
-        # Note: Node processor would be set up here when implementing
-        # the JSON Observer integration
+        from ..node_system.processor import NodeProcessor
+        node_processor = NodeProcessor(
+            self.world_state, self.payload_builder, traditional_processor, self.config.db_path,
+        )
+        self.processing_hub.set_node_processor(node_processor)
 
     async def _initialize_nft_services(self) -> None:
         """Initialize NFT and blockchain services if credentials are available."""
@@ -1013,16 +1019,16 @@ class MainOrchestrator:
                 "error": str(e)
             }
 
-    def force_processing_mode(self, enable_node_based: bool) -> None:
+    async def force_processing_mode(self, enable_node_based: bool) -> bool:
         """
         Force the processing mode to a specific type.
         
         Args:
             enable_node_based: True to force node-based processing, False for traditional
         """
-        self.processing_hub.force_processing_mode(enable_node_based)
-        self.config.processing_config.enable_node_based_processing = enable_node_based
-        logger.info(f"Processing mode forced to {'node-based' if enable_node_based else 'traditional'}")
+        return await self.processing_hub.force_processing_mode(
+            "node_based" if enable_node_based else "traditional"
+        )
 
     def reset_processing_mode(self) -> None:
         """Reset processing mode to automatic determination."""

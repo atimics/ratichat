@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from typing import Any, Collection, Mapping
 
 
-PUBLIC_BOT_ALLOWED_TOOLS = frozenset(
+READ_ONLY_SOURCE_TOOLS = frozenset({"web_search", "read_webpage", "read_feed"})
+
+PUBLIC_BOT_ALLOWED_TOOLS = READ_ONLY_SOURCE_TOOLS | frozenset(
     {
         "wait",
         "send_matrix_reply",
@@ -78,7 +80,7 @@ class CapabilityPolicy:
     def filter_tool_names(self, tool_names: Collection[str], execution_scope=None) -> set[str]:
         """Return the names that may be shown to and used by the model."""
         if execution_scope and execution_scope.channel_type == "discord":
-            return set(tool_names) & {"wait", "send_discord_reply"}
+            return set(tool_names) & ({"wait", "send_discord_reply"} | READ_ONLY_SOURCE_TOOLS)
         return {
             name for name in tool_names
             if self.allows(name) and (
@@ -144,8 +146,18 @@ class CapabilityPolicy:
                 f"Tool '{tool_name}' is blocked by the "
                 f"'{self.profile}' capability profile"
             )
-        if execution_scope and execution_scope.channel_type == "discord" and tool_name not in {"wait", "send_discord_reply"}:
+        if execution_scope and execution_scope.channel_type == "discord" and tool_name not in ({"wait", "send_discord_reply"} | READ_ONLY_SOURCE_TOOLS):
             return "Use a Discord reply for this request"
+        if tool_name in READ_ONLY_SOURCE_TOOLS:
+            if not execution_scope or not execution_scope.latest_event_id:
+                return "A current chat request is required"
+            if execution_scope.channel_type == "discord" and execution_scope.channel_id not in self.approved_discord_channel_ids:
+                return "Use a configured Discord channel"
+            if execution_scope.channel_type == "matrix" and execution_scope.channel_id not in self.approved_matrix_room_ids:
+                return "Use an approved Matrix room"
+            if execution_scope.channel_type not in {"discord", "matrix", "farcaster"}:
+                return "Choose a supported chat source"
+            return None
         if tool_name == "send_discord_reply":
             if not execution_scope or execution_scope.channel_type != "discord":
                 return "A current Discord mention is required"

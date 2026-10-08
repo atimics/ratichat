@@ -329,6 +329,42 @@ class PayloadBuilder:
         
         return payload
 
+    def build_request_node_payload(self, channel, node_manager, source_nodes=None):
+        """Build a node view from one trusted chat channel and its fetched sources."""
+        from ...config import settings
+
+        messages = [
+            {"id": message.id, "sender_id": message.sender,
+             "sender": message.sender_display_name or message.sender_username or message.sender,
+             "content": message.content[:4000], "timestamp": message.timestamp}
+            for message in channel.recent_messages[-settings.AI_CONVERSATION_HISTORY_LENGTH:]
+        ]
+        channel_path = f"channels.{channel.type}.{channel.id}"
+        catalog = {
+            channel_path: {"id": channel.id, "type": channel.type,
+                           "name": channel.name, "recent_messages": messages},
+            **(source_nodes or {}),
+        }
+        expanded, collapsed = {}, {}
+        for path, data in catalog.items():
+            metadata = node_manager.get_node_metadata(path)
+            if metadata.is_expanded:
+                expanded[path] = {"data": data, "is_pinned": metadata.is_pinned}
+            else:
+                collapsed[path] = {"summary": metadata.ai_summary or data.get("description", f"Fetched source {path}")}
+        return {
+            "processing_mode": "node_based",
+            "current_processing_channel_id": channel.id,
+            # Action authority comes from observer IDs, separate from source text.
+            "channels": {channel.id: {"type": channel.type, "recent_messages": [
+                {key: message[key] for key in ("id", "sender_id", "timestamp")}
+                for message in messages
+            ]}},
+            "expanded_nodes": expanded,
+            "collapsed_node_summaries": collapsed,
+            "expansion_status": node_manager.get_expansion_status_summary(),
+        }
+
     @staticmethod
     def estimate_payload_size(
         world_state_data: WorldStateData,
