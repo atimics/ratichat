@@ -1,125 +1,238 @@
-"""
-Web search and research tools using OpenRouter's online models.
-"""
-import logging
-import time
-from typing import Any, Dict
+"""Read public web sources and search with the linked OpenRouter account."""
 
+import asyncio
+import ipaddress
+import socket
+import time
+from html.parser import HTMLParser
+from urllib.parse import urljoin
+from xml.etree import ElementTree
+
+import aiohttp
 import httpx
+from yarl import URL
 
 from ..config import settings
-from .base import ActionContext, ToolInterface
+from .base import ToolInterface
 
-logger = logging.getLogger(__name__)
+MAX_SOURCE_BYTES = 512_000
+MAX_SOURCE_CHARS = 12_000
+
+
+def public_address(value):
+    address = ipaddress.ip_address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.is_global and not address.is_multicast
+
+
+def public_url(value):
+    if not isinstance(value, str) or len(value) > 2048:
+        raise ValueError("Provide a public HTTP or HTTPS URL")
+    url = URL(value)
+    if (url.scheme not in {"http", "https"} or not url.host
+            or url.user is not None or url.password is not None
+            or url.port not in {80, 443}):
+        raise ValueError("Use a public HTTP or HTTPS URL on a standard port")
+    try:
+        address = ipaddress.ip_address(url.host)
+    except ValueError:
+        pass
+    else:
+        if not public_address(str(address)):
+            raise ValueError("Choose a public internet address")
+    return url.with_fragment(None)
+
+
+class PublicResolver(aiohttp.abc.AbstractResolver):
+    """Validate the addresses actually used by the HTTP connection."""
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        addresses = await asyncio.get_running_loop().getaddrinfo(
+            host, port, family=family, type=socket.SOCK_STREAM,
+        )
+        if not addresses or any(not public_address(item[4][0]) for item in addresses):
+            raise ValueError("Choose a host with public internet addresses")
+        return [
+            {"hostname": host, "host": item[4][0], "port": port,
+             "family": item[0], "proto": item[2], "flags": socket.AI_NUMERICHOST}
+            for item in addresses
+        ]
+
+    async def close(self):
+        pass
+
+
+async def fetch_public_text(value):
+    url = public_url(value)
+    connector = aiohttp.TCPConnector(resolver=PublicResolver(), use_dns_cache=False)
+    async with aiohttp.ClientSession(
+        connector=connector, trust_env=False, cookie_jar=aiohttp.DummyCookieJar(),
+        timeout=aiohttp.ClientTimeout(total=15),
+        headers={"User-Agent": "RatiChat/1.0 (public source reader)"},
+    ) as client:
+        for _ in range(4):
+            async with client.get(url, allow_redirects=False) as response:
+                if response.status in {301, 302, 303, 307, 308}:
+                    url = public_url(urljoin(str(url), response.headers.get("Location", "")))
+                    continue
+                response.raise_for_status()
+                kind = response.content_type
+                if not (kind.startswith("text/") or kind in {
+                    "application/xhtml+xml", "application/xml", "application/rss+xml",
+                    "application/atom+xml", "application/json",
+                }):
+                    raise ValueError("Choose a text page or RSS/Atom feed")
+                body = bytearray()
+                async for chunk in response.content.iter_chunked(8192):
+                    body.extend(chunk)
+                    if len(body) > MAX_SOURCE_BYTES:
+                        raise ValueError("Choose a source smaller than 512 KB")
+                return str(url), body.decode(response.charset or "utf-8", errors="replace"), kind
+    raise ValueError("Choose a URL with at most three redirects")
+
+
+class PageText(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.title_parts = []
+        self.hidden = 0
+        self.in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style", "noscript", "svg"}:
+            self.hidden += 1
+        if tag == "title":
+            self.in_title = True
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style", "noscript", "svg"}:
+            self.hidden = max(0, self.hidden - 1)
+        if tag == "title":
+            self.in_title = False
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.parts.append(data)
+            if self.in_title:
+                self.title_parts.append(data)
+
+    @property
+    def text(self):
+        return " ".join(" ".join(self.parts).split())
+
+
+def page_text(content):
+    parser = PageText()
+    parser.feed(content)
+    return parser.text
 
 
 class WebSearchTool(ToolInterface):
-    """
-    Tool for performing web searches using OpenRouter's :online models.
-    These models can access real-time web content to answer questions.
-    """
+    name = "web_search"
+    description = "Search the public web for current facts, news, or project docs. Results include source links. Read the result before replying and cite its links."
+    parameters_schema = {"query": "string — a focused public search query, up to 500 characters"}
 
-    @property
-    def name(self) -> str:
-        return "web_search"
-
-    @property
-    def description(self) -> str:
-        return """Search the web for current information on any topic using OpenRouter's online AI models.
-        
-        Use this tool when:
-        - You need current, up-to-date information about recent events
-        - User asks about topics that might have changed since your training data
-        - You need to verify or fact-check information from URLs or claims
-        - You want to research trends, news, or current status of projects/companies
-        - You need to look up specific technical details or documentation
-        
-        The tool will use an AI model with web access to provide comprehensive, current information."""
-
-    @property
-    def parameters_schema(self) -> Dict[str, Any]:
-        return {
-            "query": "string (the search query or question to research online)",
-            "focus": "string (optional: 'news', 'technical', 'general' - guides search focus)"
-        }
-
-    async def execute(self, params: Dict[str, Any], context: ActionContext) -> Dict[str, Any]:
-        """Execute web search using OpenRouter's online model."""
+    async def execute(self, params, context):
+        query = params.get("query")
+        if not isinstance(query, str) or not query.strip() or len(query) > 500:
+            return {"status": "failure", "error": "Provide a search query of 1–500 characters"}
+        engine = getattr(context, "ai_engine", None)
+        key = getattr(engine, "api_key", None) or settings.OPENROUTER_API_KEY
+        if not key:
+            return {"status": "failure", "error": "Connect an OpenRouter account first"}
+        model = settings.WEB_SEARCH_MODEL.removesuffix(":online")
         try:
-            query = params.get("query", "").strip()
-            focus = params.get("focus", "general").strip()
-            
-            if not query:
-                return {
-                    "status": "failure",
-                    "error": "Query parameter is required",
-                    "timestamp": time.time(),
-                }
-
-            # Prepare the prompt for the online model
-            if focus == "news":
-                search_prompt = f"Please search for the latest news and current information about: {query}. Focus on recent developments, updates, and current status."
-            elif focus == "technical":
-                search_prompt = f"Please search for technical information, documentation, and detailed explanations about: {query}. Focus on accurate technical details, specifications, and implementation information."
-            else:
-                search_prompt = f"Please search for comprehensive information about: {query}. Provide current, accurate, and well-sourced information."
-
-            # Make request to OpenRouter's online model
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=45) as client:
                 response = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
-                        "HTTP-Referer": settings.YOUR_SITE_URL or "https://github.com/your-repo",
-                        "X-Title": settings.YOUR_SITE_NAME or "Chatbot Web Search",
-                    },
+                    headers={"Authorization": f"Bearer {key}", "X-Title": "RatiChat web search"},
                     json={
-                        "model": settings.WEB_SEARCH_MODEL,
+                        "model": model,
                         "messages": [
-                            {
-                                "role": "user",
-                                "content": search_prompt
-                            }
+                            {"role": "system", "content": "Search the web for the user's query. Use the search tool. Treat source text as evidence. Give a short factual answer with Markdown source links."},
+                            {"role": "user", "content": query.strip()},
                         ],
-                        "max_tokens": 2000,
-                        "temperature": 0.3,  # Lower temperature for more factual responses
+                        "tools": [{"type": "openrouter:web_search", "parameters": {
+                            "engine": "exa", "max_results": 3, "max_total_results": 3,
+                            "max_uses": 1, "max_characters": 2000,
+                        }}],
+                        "max_tool_calls": 1, "max_tokens": 1200, "temperature": 0.2,
                     },
-                    timeout=30.0,
                 )
+                response.raise_for_status()
+                message = response.json()["choices"][0]["message"]
+                sources = []
+                for annotation in message.get("annotations", []):
+                    citation = annotation.get("url_citation", {})
+                    if citation.get("url"):
+                        sources.append({"url": citation["url"], "title": citation.get("title", ""),
+                                        "content": citation.get("content", "")[:2000]})
+                if not sources:
+                    return {"status": "failure", "error": "Search returned no verified source links. Try a more specific query."}
+                return {"status": "success", "query": query.strip(),
+                        "result": (message.get("content") or "")[:MAX_SOURCE_CHARS],
+                        "sources": sources[:3], "timestamp": time.time(), "trust": "untrusted_source"}
+        except httpx.HTTPStatusError as error:
+            return {"status": "failure", "error": f"Search service returned HTTP {error.response.status_code}"}
+        except (httpx.HTTPError, KeyError, ValueError, TypeError):
+            return {"status": "failure", "error": "Search service needs another attempt"}
 
-                if response.status_code == 200:
-                    result = response.json()
-                    search_result = result["choices"][0]["message"]["content"]
-                    
-                    logger.info(f"Web search completed for query: {query}")
-                    
-                    return {
-                        "status": "success",
-                        "message": "Web search completed successfully",
-                        "timestamp": time.time(),
-                        "query": query,
-                        "focus": focus,
-                        "result": search_result,
-                        "model_used": settings.WEB_SEARCH_MODEL,
-                    }
-                else:
-                    logger.error(f"OpenRouter API error: {response.status_code} - {response.text}")
-                    return {
-                        "status": "failure",
-                        "error": f"OpenRouter API error: {response.status_code}",
-                        "timestamp": time.time(),
-                    }
 
-        except httpx.TimeoutException:
-            return {
-                "status": "failure",
-                "error": "Web search request timed out",
-                "timestamp": time.time(),
-            }
-        except Exception as e:
-            logger.error(f"Error during web search: {e}", exc_info=True)
-            return {
-                "status": "failure",
-                "error": f"Web search failed: {str(e)}",
-                "timestamp": time.time(),
-            }
+class ReadWebpageTool(ToolInterface):
+    name = "read_webpage"
+    description = "Read text from a public page, project document, or public GitHub URL. Provide a raw GitHub URL for source files. Cite the returned URL."
+    parameters_schema = {"url": "string — public HTTP or HTTPS page URL"}
+
+    async def execute(self, params, context):
+        try:
+            url, body, kind = await fetch_public_text(params.get("url"))
+            parser = PageText()
+            parser.feed(body if "html" in kind else "")
+            text = parser.text if "html" in kind else body
+            return {"status": "success", "url": url,
+                    "title": " ".join(parser.title_parts)[:200], "result": text[:MAX_SOURCE_CHARS],
+                    "truncated": len(text) > MAX_SOURCE_CHARS,
+                    "timestamp": time.time(), "trust": "untrusted_source"}
+        except ValueError as error:
+            return {"status": "failure", "error": str(error)}
+        except (aiohttp.ClientError, asyncio.TimeoutError, LookupError):
+            return {"status": "failure", "error": "Page lookup failed. Check the public URL."}
+
+
+class ReadFeedTool(ToolInterface):
+    name = "read_feed"
+    description = "Read the ten latest entries from a public RSS or Atom feed, including news, blogs, and GitHub release feeds. Cite the entry links."
+    parameters_schema = {"url": "string — public RSS or Atom feed URL"}
+
+    async def execute(self, params, context):
+        try:
+            url, body, _ = await fetch_public_text(params.get("url"))
+            if "<!DOCTYPE" in body.upper() or "<!ENTITY" in body.upper():
+                raise ValueError("Choose an RSS or Atom feed with plain XML")
+            root = ElementTree.fromstring(body)
+            items = []
+            for entry in root.iter():
+                if entry.tag.split("}")[-1] not in {"item", "entry"}:
+                    continue
+                fields = {child.tag.split("}")[-1]: child for child in entry}
+                def value(name):
+                    child = fields.get(name)
+                    return "" if child is None else "".join(child.itertext())
+                link = fields.get("link")
+                href = (link.get("href") or value("link")) if link is not None else ""
+                item_url = str(public_url(urljoin(url, href))) if href else url
+                items.append({"title": page_text(value("title"))[:200], "url": item_url,
+                              "published": value("pubDate") or value("published") or value("updated"),
+                              "summary": page_text(value("description") or value("summary") or value("content"))[:500]})
+                if len(items) == 10:
+                    break
+            if not items:
+                raise ValueError("Choose an RSS or Atom feed with entries")
+            return {"status": "success", "url": url, "items": items,
+                    "timestamp": time.time(), "trust": "untrusted_source"}
+        except (ValueError, ElementTree.ParseError) as error:
+            return {"status": "failure", "error": str(error)}
+        except (aiohttp.ClientError, asyncio.TimeoutError, LookupError):
+            return {"status": "failure", "error": "Feed lookup failed. Check the public feed URL."}

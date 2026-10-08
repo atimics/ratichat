@@ -73,8 +73,8 @@ async def get_system_status(orchestrator: MainOrchestrator = Depends(get_orchest
         status = {
             "system_running": orchestrator.running,
             "config": {
-                "processing_mode": "node-based" if processing_status.get("node_based_enabled") else "traditional",
-                "ai_model": "gpt-4o-mini",  # This could be made configurable
+                "processing_mode": processing_status["current_mode"],
+                "ai_model": orchestrator.ai_engine.model,
                 "max_actions_per_cycle": 3
             },
             "world_state": world_state_metrics,
@@ -162,7 +162,9 @@ async def execute_system_command(
             if mode not in ["traditional", "node-based"]:
                 raise HTTPException(status_code=400, detail="Mode must be 'traditional' or 'node-based'")
             
-            orchestrator.processing_hub.force_processing_mode(mode == "node-based")
+            changed = await orchestrator.processing_hub.force_processing_mode(mode.replace("-", "_"))
+            if not changed:
+                raise HTTPException(status_code=400, detail="Requested processor is unavailable")
             return StatusResponse(
                 status="success",
                 message=f"Processing mode forced to {mode}",

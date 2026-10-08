@@ -81,6 +81,8 @@ class ProcessingHub:
     def set_node_processor(self, processor):
         """Set the node-based processing component."""
         self.node_processor = processor
+        self.node_manager = processor.node_manager
+        self.current_processing_mode = self._determine_processing_mode([])
         
     async def start_processing_loop(self) -> None:
         """Start the main processing event loop."""
@@ -140,15 +142,14 @@ class ProcessingHub:
                         await asyncio.sleep(min(wait_time, self.config.observation_interval))
                     continue
 
-                # Record the cycle for rate limiting
-                self.rate_limiter.record_cycle(cycle_start)
-
                 # Get current world state
                 current_state = self.world_state.to_dict()
                 current_hash = self._hash_state(current_state)
 
                 # Check if state has changed
                 if current_hash != last_state_hash:
+                    # Idle polling keeps the processing budget available for chat.
+                    self.rate_limiter.record_cycle(cycle_start)
                     logger.info(f"World state changed, processing cycle {self.cycle_count}")
 
                     # Get active channels to determine primary focus
@@ -188,10 +189,8 @@ class ProcessingHub:
                 
         except Exception as e:
             logger.error(f"Error in world state processing: {e}")
-            # Fallback to traditional processing
-            if self.current_processing_mode != "traditional" and self.traditional_processor:
-                logger.warning("Falling back to traditional processing")
-                await self._process_with_traditional_strategy(active_channels)
+            # Mode fallback happens before a turn starts. A failed turn may
+            # already have sent an external action, so keep its claimed scope.
 
     def _determine_processing_mode(self, active_channels: List[str]) -> str:
         """
@@ -207,7 +206,7 @@ class ProcessingHub:
         if not self.config.enable_node_based_processing or not self.node_processor:
             return "traditional"
         
-        # Dynamic decision based on estimated payload size
+        # Node processing is the configured default, including small requests.
         try:
             estimated_size = self.payload_builder.estimate_payload_size(
                 self.world_state.get_state_data()
@@ -218,19 +217,9 @@ class ProcessingHub:
             if len(self.payload_size_history) > 10:
                 self.payload_size_history.pop(0)
             
-            # Use node-based if payload is likely to be too large
-            if estimated_size > self.config.max_traditional_payload_size:
-                logger.info(f"Switching to node-based processing (estimated size: {estimated_size} bytes)")
-                return "node_based"
-            
-            # Use traditional for smaller payloads
-            logger.debug(f"Using traditional processing (estimated size: {estimated_size} bytes)")
-            return "traditional"
-            
         except Exception as e:
             logger.error(f"Error estimating payload size: {e}")
-            # Default to traditional on estimation error
-            return "traditional"
+        return "node_based"
 
     async def _process_with_traditional_strategy(self, active_channels: List[str]) -> None:
         """Process using the traditional full payload approach."""
@@ -287,15 +276,16 @@ class ProcessingHub:
             
             # Process with node-based approach
             cycle_id = f"cycle_{self.cycle_count}"
-            result = await self.node_processor.process_cycle(
-                cycle_id=cycle_id,
-                primary_channel_id=primary_channel_id,
-                context={
-                    "active_channels": active_channels,
-                    "cycle_count": self.cycle_count,
-                    "processing_mode": "node_based"
-                }
-            )
+            result = {"actions_executed": 0}
+            # Every active channel gets its own scoped request. A busy channel
+            # cannot hide another channel's pending request.
+            channel_ids = [primary_channel_id] + [channel for channel in active_channels if channel != primary_channel_id]
+            for channel_id in channel_ids:
+                turn = await self.node_processor.process_cycle(
+                    cycle_id=cycle_id, primary_channel_id=channel_id,
+                    context={"processing_mode": "node_based"},
+                )
+                result["actions_executed"] += turn.get("actions_executed", 0)
             
             if result.get("actions_executed", 0) > 0:
                 logger.info(f"Node processor executed {result['actions_executed']} actions")
@@ -390,6 +380,7 @@ class ProcessingHub:
             "payload_size_history": self.payload_size_history[-5:],  # Last 5 estimates
             "traditional_processor_available": self.traditional_processor is not None,
             "node_processor_available": self.node_processor is not None,
+            "node_request": self.node_processor.last_result if self.node_processor else {},
             "config": {
                 "enable_node_based_processing": self.config.enable_node_based_processing,
                 "force_traditional_fallback": self.config.force_traditional_fallback,
@@ -426,6 +417,8 @@ class ProcessingHub:
             self.config.force_traditional_fallback = True
         else:
             self.config.force_traditional_fallback = False
+            self.config.enable_node_based_processing = True
+        self.current_processing_mode = mode
         
         logger.info(f"Forced processing mode to: {mode}")
         return True
@@ -433,4 +426,5 @@ class ProcessingHub:
     def reset_processing_mode(self):
         """Reset to automatic processing mode selection."""
         self.config.force_traditional_fallback = False
+        self.current_processing_mode = self._determine_processing_mode([])
         logger.info("Reset to automatic processing mode selection")

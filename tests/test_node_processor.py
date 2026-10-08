@@ -1,0 +1,170 @@
+"""Node request isolation, source round trips, limits, and runtime wiring."""
+
+import copy
+import json
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+
+from chatbot.core.ai_engine import ActionPlan, DecisionResult
+from chatbot.core.node_system.processor import NodeProcessor
+from chatbot.core.orchestration.capability_policy import CapabilityPolicy
+from chatbot.core.orchestration.main_orchestrator import TraditionalProcessor
+from chatbot.core.orchestration.processing_hub import ProcessingHub
+from chatbot.core.world_state import WorldStateManager
+from chatbot.core.world_state.payload_builder import PayloadBuilder
+from chatbot.core.world_state.structures import Message
+from chatbot.tools.registry import ToolRegistry
+
+
+def plan(name, **params):
+    return ActionPlan(name, params, "test", 5)
+
+
+def decision(*actions):
+    return DecisionResult(list(actions), "test", "test", "cycle")
+
+
+def make_processor(tmp_path, decisions, profile="matrix_steward"):
+    world = WorldStateManager()
+    world.add_channel("20", "discord", "general")
+    world.add_message("20", Message("40", "discord", "50", "lookup request " + "x" * 700, time.time(), channel_id="20"))
+    world.add_channel("!private:example.com", "matrix", "private")
+    world.add_message("!private:example.com", Message("$secret", "matrix", "@owner:example.com", "PRIVATE SECRET", time.time()))
+    ai = SimpleNamespace(api_key="linked-key", make_decision=AsyncMock(side_effect=decisions))
+    registry = ToolRegistry()
+    tools = {}
+    for name in ["web_search", "read_webpage", "read_feed", "send_discord_reply", "manage_matrix_server", "wait"]:
+        tools[name] = SimpleNamespace(name=name, description=name, parameters_schema={}, execute=AsyncMock(return_value={"status": "success", "result": "public evidence", "url": "https://example.com/source"}))
+        registry.register_tool(tools[name])
+    observer = SimpleNamespace(can_reply=Mock(return_value=True))
+    executor = TraditionalProcessor(ai, registry, Mock(), AsyncMock(), SimpleNamespace(discord_observer=observer), CapabilityPolicy(profile, approved_discord_channel_ids=["20"]))
+    processor = NodeProcessor(world, PayloadBuilder(), executor, str(tmp_path / "nodes.db"))
+    return processor, ai, tools
+
+
+@pytest.mark.asyncio
+async def test_lookup_result_is_read_before_reply_and_private_state_stays_out(tmp_path):
+    reply = plan("send_discord_reply", channel_id="20", reply_to_id="40", content="Evidence [source](https://example.com/source)")
+    processor, ai, tools = make_processor(tmp_path, [
+        decision(plan("web_search", query="public topic"), reply), decision(reply),
+    ])
+    payloads = []
+    original = ai.make_decision.side_effect
+    async def capture(payload, cycle):
+        payloads.append(copy.deepcopy(payload))
+        return next(original)
+    ai.make_decision.side_effect = capture
+    result = await processor.process_cycle("test", "20")
+    assert result["lookups"] == 1
+    tools["web_search"].execute.assert_awaited_once()
+    tools["send_discord_reply"].execute.assert_awaited_once()
+    assert "public evidence" in json.dumps(payloads[1])
+    assert "public evidence" not in json.dumps(payloads[0])
+    for payload in payloads:
+        assert "PRIVATE SECRET" not in json.dumps(payload)
+        assert "!private" not in json.dumps(payload)
+        assert set(payload["channels"]) == {"20"}
+        assert "x" * 700 in payload["expanded_nodes"]["channels.discord.20"]["data"]["recent_messages"][-1]["content"]
+        assert "manage_matrix_server" not in payload["available_tools"]
+
+
+@pytest.mark.asyncio
+async def test_node_expansion_is_limited_to_request_catalog(tmp_path):
+    processor, ai, _ = make_processor(tmp_path, [
+        decision(plan("expand_node", node_path="channels.matrix.!private:example.com")),
+        decision(plan("wait")),
+    ], profile="operator")
+    await processor.process_cycle("test", "20")
+    assert "channels.matrix.!private:example.com" not in processor.node_manager.node_metadata
+    assert "PRIVATE SECRET" not in json.dumps(processor.last_payload)
+    assert not processor.last_payload["tool_results"][0]["result"]["success"]
+
+
+@pytest.mark.asyncio
+async def test_source_failure_is_available_to_the_reply_step(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [
+        decision(plan("read_webpage", url="https://example.com/missing")),
+        decision(plan("send_discord_reply", channel_id="20", reply_to_id="40", content="The page lookup needs another attempt.")),
+    ])
+    tools["read_webpage"].execute.return_value = {"status": "failure", "error": "Page returned 404"}
+    await processor.process_cycle("test", "20")
+    assert "Page returned 404" in json.dumps(processor.last_payload)
+    tools["send_discord_reply"].execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_repeated_state_and_restart_keep_paid_request_single_use(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [decision(plan("wait"))])
+    await processor.process_cycle("first", "20")
+    assert (await processor.process_cycle("again", "20"))["duplicate"]
+    restarted = NodeProcessor(processor.world_state, processor.payload_builder, processor.executor, processor.db_path)
+    assert (await restarted.process_cycle("restart", "20"))["duplicate"]
+    ai.make_decision.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_source_results_are_cleared_for_a_new_request(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [
+        decision(plan("web_search", query="topic")), decision(plan("wait")), decision(plan("wait")),
+    ])
+    await processor.process_cycle("first", "20")
+    processor.world_state.add_message("20", Message("41", "discord", "60", "new request", time.time()))
+    await processor.process_cycle("second", "20")
+    assert "public evidence" not in json.dumps(processor.last_payload)
+    assert "sources.result_1" not in processor.node_manager.node_metadata
+
+
+@pytest.mark.asyncio
+async def test_lookup_budget_forces_a_final_reply_step(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [
+        decision(plan("web_search", query="one"), plan("read_webpage", url="https://example.com"), plan("read_feed", url="https://example.com/feed")),
+        decision(plan("web_search", query="four"), plan("send_discord_reply", channel_id="20", reply_to_id="40", content="answer")),
+    ])
+    result = await processor.process_cycle("test", "20")
+    assert result["lookups"] == 3
+    assert processor.last_payload["final_step"]
+    assert "web_search" not in processor.last_payload["available_tools"]
+    tools["web_search"].execute.assert_awaited_once()
+    tools["send_discord_reply"].execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_model_failure_stays_in_claimed_node_turn(tmp_path):
+    processor, ai, _ = make_processor(tmp_path, [RuntimeError("model failed")])
+    result = await processor.process_cycle("test", "20")
+    assert result["failed"]
+    assert (await processor.process_cycle("test", "20"))["duplicate"]
+
+
+def test_node_mode_is_default_for_small_requests():
+    hub = ProcessingHub(Mock(), Mock(), Mock())
+    processor = SimpleNamespace(node_manager=Mock(), last_result={})
+    hub.set_node_processor(processor)
+    assert hub.get_processing_status()["current_mode"] == "node_based"
+    assert hub._determine_processing_mode([]) == "node_based"
+    hub.config.force_traditional_fallback = True
+    assert hub._determine_processing_mode([]) == "traditional"
+
+
+@pytest.mark.asyncio
+async def test_idle_polling_preserves_cycle_budget():
+    world, rate = Mock(), Mock()
+    hub = ProcessingHub(world, Mock(), rate)
+    hub.config.observation_interval = 0.001
+    hub.running = True
+    count = 0
+    def state():
+        nonlocal count
+        count += 1
+        if count >= 3:
+            hub.running = False
+        return {"channels": {}}
+    world.to_dict.side_effect = state
+    rate.can_process_cycle.return_value = (True, 0)
+    hub._process_world_state = AsyncMock()
+    await hub._main_event_loop()
+    rate.record_cycle.assert_called_once()
+    hub._process_world_state.assert_awaited_once()
