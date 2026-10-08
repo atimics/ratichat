@@ -96,14 +96,16 @@ class NodeProcessor:
             "sources.feeds": {"description": "Read news, blogs, or GitHub release RSS/Atom feeds with read_feed."},
         }
         scope_payload = self.payload_builder.build_request_node_payload(channel, self.node_manager)
+        channel_node = scope_payload["expanded_nodes"][channel_path]["data"]
         scope = self.policy.scope_from_payload(scope_payload)
         allowed = self.policy.filter_tool_names(self.executor.tool_registry.get_tool_names(), scope)
         lookups, executed = 0, 0
         results = []
         seen_lookups = set()
+        force_answer = False
         try:
             for step in range(self.MAX_STEPS):
-                final_step = step == self.MAX_STEPS - 1 or lookups >= self.MAX_LOOKUPS
+                final_step = force_answer or step == self.MAX_STEPS - 1 or lookups >= self.MAX_LOOKUPS
                 names = allowed - READ_ONLY_SOURCE_TOOLS if final_step else allowed
                 payload = self.payload_builder.build_request_node_payload(channel, self.node_manager, sources)
                 self.catalog = {channel_path: {}, **sources}
@@ -123,10 +125,31 @@ class NodeProcessor:
                         "managed_room_ids": sorted(self.policy.managed_room_ids),
                     }
                 self.last_payload = copy.deepcopy(payload)
+                if final_step:
+                    # Include the bounded source data even when the planner has
+                    # collapsed it. Answer composition has one fixed destination.
+                    payload["answer_nodes"] = {
+                        channel_path: channel_node,
+                        **sources,
+                    }
+                    self.last_payload = copy.deepcopy(payload)
+                    content = await self.ai_engine.compose_reply(payload)
+                    failed = not content
+                    content = content or "Please try a fresh request. The AI reply service needs another attempt."
+                    tool_name = {"discord": "send_discord_reply", "matrix": "send_matrix_reply", "farcaster": "send_farcaster_reply"}[scope.channel_type]
+                    parameters = {"content": content}
+                    if scope.channel_type == "farcaster":
+                        parameters["reply_to_hash"] = scope.latest_event_id
+                    else:
+                        parameters.update({"channel_id": scope.channel_id, "reply_to_id": scope.latest_event_id})
+                    reply = ActionPlan(tool_name, parameters, "Answer the current request from fetched sources", 1)
+                    result = await self.executor._execute_action_and_return_result(reply, scope)
+                    return self._result(executed + 1, lookups, step + 1, failed=failed or result.get("status") in {"blocked", "failure", "error"})
                 decision = await self.ai_engine.make_decision(payload, f"{cycle_id}_step_{step}")
                 actions = decision.selected_actions[:3]
                 if not actions:
-                    break
+                    force_answer = True
+                    continue
                 # A reply selected alongside a lookup is based on stale context.
                 reads = [action for action in actions if action.action_type in READ_ONLY_SOURCE_TOOLS | NODE_TOOLS]
                 if reads and not final_step:
@@ -169,6 +192,10 @@ class NodeProcessor:
                             await self.executor._execute_action_and_return_result(reply, scope)
                         return self._result(executed, lookups, step + 1)
                     if action.action_type in REPLY_TOOLS | {"wait"}:
+                        if action.action_type in REPLY_TOOLS and result.get("status") in {"blocked", "failure", "error"}:
+                            results.append({"tool": action.action_type, "result": result})
+                            force_answer = True
+                            break
                         return self._result(executed, lookups, step + 1)
             return self._result(executed, lookups, step + 1)
         except Exception:

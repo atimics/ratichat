@@ -190,3 +190,20 @@ async def test_node_decisions_request_valid_json_from_provider(mode):
         assert "Answer current_request" in requests[0]["messages"][0]["content"]
     else:
         assert "response_format" not in requests[0]
+
+
+@pytest.mark.asyncio
+async def test_answer_composition_returns_text_from_scoped_sources():
+    import httpx
+    requests = []
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({"content": "Answer [source](https://example.com)"})}}]})
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    engine = AIDecisionEngine(api_key="test-key")
+    with patch("chatbot.core.ai_engine.httpx.AsyncClient", return_value=client):
+        text = await engine.compose_reply({"current_request": {"content": "question"}, "answer_nodes": {"source": "public evidence"}, "private_state": "PRIVATE SECRET"})
+    assert text == "Answer [source](https://example.com)"
+    assert "public evidence" in requests[0]["messages"][1]["content"]
+    assert "PRIVATE SECRET" not in requests[0]["messages"][1]["content"]
+    assert requests[0]["response_format"] == {"type": "json_object"}
