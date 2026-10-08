@@ -355,6 +355,7 @@ class PayloadBuilder:
         return {
             "processing_mode": "node_based",
             "current_processing_channel_id": channel.id,
+            "current_request": messages[-1] if messages else {},
             # Action authority comes from observer IDs, separate from source text.
             "channels": {channel.id: {"type": channel.type, "recent_messages": [
                 {key: message[key] for key in ("id", "sender_id", "timestamp")}

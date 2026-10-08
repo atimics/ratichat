@@ -225,3 +225,15 @@ async def test_node_runtime_api_reports_actual_mode_and_payload(tmp_path):
     assert payload["ai_world_state"] == processor.last_payload
     await hub.force_processing_mode("traditional")
     assert (await get_world_state(orchestrator))["processing_mode"] == "traditional"
+
+
+def test_current_request_is_explicit_after_prior_messages():
+    from chatbot.core.node_system.node_manager import NodeManager
+    world = WorldStateManager()
+    world.add_channel("20", "discord", "general")
+    world.add_message("20", Message("40", "discord", "50", "old request", time.time()))
+    world.add_message("20", Message("41", "discord", "60", "new request", time.time()))
+    payload = PayloadBuilder().build_request_node_payload(world.get_channel("20"), NodeManager())
+    assert payload["current_request"]["id"] == "41"
+    assert payload["current_request"]["content"] == "new request"
+    assert payload["current_request"]["sender_id"] == "60"

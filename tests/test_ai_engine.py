@@ -166,3 +166,27 @@ class TestAIDecisionEngine:
         # Current implementation doesn't have cleanup method, so just verify it doesn't crash
         # If cleanup method is added later, this test should be updated
         assert engine.api_key == "test_key"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["node_based", "traditional"])
+async def test_node_decisions_request_valid_json_from_provider(mode):
+    import httpx
+    requests = []
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({
+            "selected_actions": [{"action_type": "send_discord_reply", "parameters": {"channel_id": "20", "reply_to_id": "40", "content": "[Docs](https://docs.python.org/)"}, "reasoning": "Cite source", "priority": 5}],
+            "reasoning": "Reply", "observations": "Source read",
+        })}}]})
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    engine = AIDecisionEngine(api_key="test-key")
+    with patch("chatbot.core.ai_engine.httpx.AsyncClient", return_value=client):
+        result = await engine.make_decision({"processing_mode": mode, "current_request": {"id": "40", "content": "Read this page"}}, "test")
+    assert result.selected_actions[0].parameters["reply_to_id"] == "40"
+    if mode == "node_based":
+        assert requests[0]["response_format"] == {"type": "json_object"}
+        assert requests[0]["temperature"] == 0.2
+        assert "Answer current_request" in requests[0]["messages"][0]["content"]
+    else:
+        assert "response_format" not in requests[0]

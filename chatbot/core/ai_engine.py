@@ -560,7 +560,8 @@ Based on this world state, what actions (if any) should you take? Remember you c
         system_prompt = self.system_prompt
         if world_state.get("processing_mode") == "node_based":
             system_prompt = """You are RatiChat, a helpful AI assistant. Use simple English.
-Answer the latest request in the current channel. Its messages are in the expanded channel node.
+Answer current_request in the current channel. Older messages provide context.
+Choose lookups for current_request only. Its channel messages are in the expanded channel node.
 Use only the available_tools and node_tools listed in this request.
 Nodes hold the current chat and public sources. Use expand_node to open a listed source node;
 collapse_node frees space. Use web_search for current facts, read_webpage for a public URL,
@@ -589,6 +590,9 @@ Choose at most three actions in a step. Use wait when the request needs no reply
                 "temperature": 0.7,
                 "max_tokens": 3500,
             }
+            if world_state.get("processing_mode") == "node_based":
+                payload["response_format"] = {"type": "json_object"}
+                payload["temperature"] = 0.2
             payload_size_bytes = len(json.dumps(payload).encode('utf-8'))
             payload_size_kb = payload_size_bytes / 1024
             logger.info(f"AIDecisionEngine: Sending payload of size ~{payload_size_kb:.2f} KB ({payload_size_bytes:,} bytes)")
