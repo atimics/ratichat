@@ -149,6 +149,9 @@ class NodeProcessor:
                         results.append({"tool": action.action_type, "node_path": path, "status": result.get("status")})
                         executed += 1
                     continue
+                if self.policy.profile == "matrix_steward":
+                    management = [action for action in actions if action.action_type in MANAGEMENT_TOOLS]
+                    actions = management[:1] if management else actions
                 for action in actions:
                     if action.action_type not in names:
                         continue
