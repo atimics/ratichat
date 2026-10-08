@@ -33,7 +33,7 @@ def make_processor(tmp_path, decisions, profile="matrix_steward"):
     world.add_message("20", Message("40", "discord", "50", "lookup request " + "x" * 700, time.time(), channel_id="20"))
     world.add_channel("!private:example.com", "matrix", "private")
     world.add_message("!private:example.com", Message("$secret", "matrix", "@owner:example.com", "PRIVATE SECRET", time.time()))
-    ai = SimpleNamespace(api_key="linked-key", make_decision=AsyncMock(side_effect=decisions))
+    ai = SimpleNamespace(api_key="linked-key", make_decision=AsyncMock(side_effect=decisions), compose_reply=AsyncMock(return_value="Final answer with [source](https://example.com/source)"))
     registry = ToolRegistry()
     tools = {}
     for name in ["web_search", "read_webpage", "read_feed", "send_discord_reply", "manage_matrix_server", "wait"]:
@@ -237,3 +237,56 @@ def test_current_request_is_explicit_after_prior_messages():
     assert payload["current_request"]["id"] == "41"
     assert payload["current_request"]["content"] == "new request"
     assert payload["current_request"]["sender_id"] == "60"
+
+
+@pytest.mark.asyncio
+async def test_node_loop_budget_ends_with_grounded_reply(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [
+        decision(plan("web_search", query="topic")),
+        *[decision(plan("expand_node", node_path="sources.result_1")) for _ in range(3)],
+    ])
+    result = await processor.process_cycle("test", "20")
+    assert result["steps"] == 5
+    assert result["lookups"] == 1
+    assert not result["failed"]
+    assert ai.make_decision.await_count == 4
+    ai.compose_reply.assert_awaited_once()
+    answer_input = ai.compose_reply.await_args.args[0]
+    assert "public evidence" in json.dumps(answer_input["answer_nodes"])
+    assert "PRIVATE SECRET" not in json.dumps(answer_input)
+    tools["send_discord_reply"].execute.assert_awaited_once()
+    reply = tools["send_discord_reply"].execute.await_args.args[0]
+    assert reply["channel_id"] == "20"
+    assert reply["reply_to_id"] == "40"
+    assert reply["content"] == ai.compose_reply.return_value
+
+
+@pytest.mark.asyncio
+async def test_empty_decision_gets_an_answer_step(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [decision()])
+    result = await processor.process_cycle("test", "20")
+    assert result["steps"] == 2
+    ai.make_decision.assert_awaited_once()
+    ai.compose_reply.assert_awaited_once()
+    tools["send_discord_reply"].execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_final_answer_failure_sends_a_factual_error_reply(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [decision()])
+    ai.compose_reply.return_value = None
+    result = await processor.process_cycle("test", "20")
+    assert result["failed"]
+    tools["send_discord_reply"].execute.assert_awaited_once()
+    assert "fresh request" in tools["send_discord_reply"].execute.await_args.args[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_final_answer_uses_trusted_target_after_bad_model_target(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [decision(
+        plan("send_discord_reply", channel_id="99", reply_to_id="99", content="wrong target"),
+    )])
+    await processor.process_cycle("test", "20")
+    tools["send_discord_reply"].execute.assert_awaited_once()
+    reply = tools["send_discord_reply"].execute.await_args.args[0]
+    assert reply["channel_id"] == "20" and reply["reply_to_id"] == "40"

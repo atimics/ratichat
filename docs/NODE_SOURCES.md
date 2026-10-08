@@ -6,8 +6,10 @@ collapse, pin, and unpin the nodes listed for that request.
 
 When a request needs fresh information, RatiChat calls a source tool. The result
 becomes a source node. The next AI step reads it and prepares a reply with links.
-A turn has at most five AI steps and three source lookups. Each web search has
-one search call and at most three results. Page reads stop at 512 KB and return
+A turn has at most five AI steps and three source lookups.
+The last step writes an answer for the current source event. If the AI service
+fails, the bot sends a short message asking for a fresh request.
+Each web search has one search call and at most three results. Page reads stop at 512 KB and return
 at most 12,000 text characters. Feeds return up to ten entries.
 
 ## Sources
