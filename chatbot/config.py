@@ -72,6 +72,13 @@ class AppConfig(BaseSettings):
     MATRIX_ADMIN_SERVER_USER_ID: str = "@conduit:rati.chat"
     MATRIX_BACKUP_INTERVAL_SECONDS: int = 86400
 
+    # Discord: comma-separated server and text channel IDs.
+    DISCORD_BOT_TOKEN: Optional[str] = None
+    DISCORD_ALLOWED_GUILD_IDS: str = ""
+    DISCORD_ALLOWED_CHANNEL_IDS: str = ""
+    DISCORD_MESSAGE_RATE_LIMIT_PER_MINUTE: int = 10
+    DISCORD_MAX_MESSAGE_CHARS: int = 4000
+
     # Telegram
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_ALLOWED_CHAT_IDS: str = ""

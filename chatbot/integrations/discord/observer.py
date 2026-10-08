@@ -1,0 +1,197 @@
+"""Receive bot mentions and send replies in configured Discord channels."""
+
+import asyncio
+import logging
+from collections import OrderedDict
+
+import discord
+
+from ...config import settings
+from ...core.world_state.structures import Message
+from ..base import Integration, IntegrationConnectionError
+from ..telegram.observer import MessageRateLimiter, parse_id_allowlist
+
+logger = logging.getLogger(__name__)
+
+
+class DiscordObserver(Integration):
+    def __init__(self, world_state_manager, config=None):
+        super().__init__("discord", "Discord", {})
+        config = config or settings
+        self.world_state = world_state_manager
+        self.token = config.DISCORD_BOT_TOKEN
+        self.allowed_guild_ids = parse_id_allowlist(config.DISCORD_ALLOWED_GUILD_IDS)
+        self.allowed_channel_ids = parse_id_allowlist(config.DISCORD_ALLOWED_CHANNEL_IDS)
+        self.max_message_chars = config.DISCORD_MAX_MESSAGE_CHARS
+        if not 1 <= self.max_message_chars <= 4000:
+            raise ValueError("DISCORD_MAX_MESSAGE_CHARS must be between 1 and 4000")
+        self._rate_limiter = MessageRateLimiter(config.DISCORD_MESSAGE_RATE_LIMIT_PER_MINUTE)
+        self.on_state_change = None
+        self.client = None
+        self._task = None
+        self._ready = asyncio.Event()
+        self._send_lock = asyncio.Lock()
+        self._requests = OrderedDict()
+        self._replies = OrderedDict()
+
+    @property
+    def integration_type(self):
+        return "discord"
+
+    @property
+    def enabled(self):
+        return bool(self.token and self.allowed_guild_ids and self.allowed_channel_ids)
+
+    async def connect(self):
+        if not self.enabled:
+            raise IntegrationConnectionError("Configure the Discord token, server IDs, and channel IDs")
+        if self._task:
+            return
+        intents = discord.Intents.none()
+        intents.guilds = True
+        intents.guild_messages = True
+        self.client = discord.Client(
+            intents=intents, allowed_mentions=discord.AllowedMentions.none(),
+            max_messages=100, member_cache_flags=discord.MemberCacheFlags.none(),
+        )
+
+        @self.client.event
+        async def on_ready():
+            self._ready.set()
+            self.world_state.update_system_status({"discord_connected": True})
+            logger.info("Discord connected")
+
+        @self.client.event
+        async def on_disconnect():
+            self.world_state.update_system_status({"discord_connected": False})
+
+        @self.client.event
+        async def on_message(message):
+            await self._handle_message(message)
+
+        @self.client.event
+        async def on_error(event, *args, **kwargs):
+            logger.error("Discord event handler failed: %s", event)
+
+        async def run_client():
+            try:
+                async with self.client:
+                    await self.client.start(self.token, reconnect=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error("Discord connection failed; check the bot token and channel permissions")
+            finally:
+                self.world_state.update_system_status({"discord_connected": False})
+
+        self._task = asyncio.create_task(run_client())
+        ready_task = asyncio.create_task(self._ready.wait())
+        try:
+            await asyncio.wait(
+                {self._task, ready_task}, timeout=30,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not self._ready.is_set() or self._task.done():
+                await self.disconnect()
+                raise IntegrationConnectionError("Discord connection needs a valid bot token and channel permissions")
+        finally:
+            ready_task.cancel()
+            await asyncio.gather(ready_task, return_exceptions=True)
+
+    async def disconnect(self):
+        if self.client:
+            await self.client.close()
+        if self._task:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+        self._task = None
+        self.client = None
+        self._ready.clear()
+        self.world_state.update_system_status({"discord_connected": False})
+
+    async def start(self):
+        await self.connect()
+
+    async def stop(self):
+        await self.disconnect()
+
+    async def get_status(self):
+        return {
+            "enabled": self.enabled,
+            "connected": bool(self.client and self.client.is_ready()),
+            "allowed_guild_ids": sorted(self.allowed_guild_ids),
+            "allowed_channel_ids": sorted(self.allowed_channel_ids),
+        }
+
+    async def test_connection(self):
+        return bool(self.client and self.client.is_ready())
+
+    def can_reply(self, channel_id, message_id):
+        request = self._requests.get(str(message_id))
+        return bool(request and request[0] == str(channel_id) and str(message_id) not in self._replies)
+
+    async def _handle_message(self, message):
+        if not self.client or not self.client.user or not message.guild:
+            return
+        channel_id, guild_id = str(message.channel.id), str(message.guild.id)
+        if guild_id not in self.allowed_guild_ids or channel_id not in self.allowed_channel_ids:
+            return
+        if message.author.bot or message.webhook_id:
+            return
+        if not any(user.id == self.client.user.id for user in message.mentions):
+            return
+        content = message.content.strip()
+        message_id = str(message.id)
+        if not content or len(content) > self.max_message_chars or message_id in self._requests:
+            return
+        if not self._rate_limiter.allow(f"{channel_id}:{message.author.id}"):
+            return
+        self._requests[message_id] = (channel_id, str(message.author.id), message.content)
+        while len(self._requests) > 1000:
+            self._requests.popitem(last=False)
+        if not self.world_state.get_channel(channel_id):
+            self.world_state.add_channel(channel_id, "discord", message.channel.name)
+        self.world_state.add_message(channel_id, Message(
+            id=message_id, channel_id=channel_id, channel_type="discord",
+            sender=str(message.author.id), sender_display_name=message.author.display_name,
+            sender_username=message.author.name, content=content,
+            timestamp=message.created_at.timestamp(),
+            metadata={"guild_id": guild_id, "bot_mentioned": True},
+        ))
+        if self.on_state_change:
+            self.on_state_change()
+
+    async def send_reply(self, channel_id, content, reply_to_id):
+        channel_id, reply_to_id = str(channel_id), str(reply_to_id)
+        if not self.client or not self.client.is_ready():
+            return {"status": "failure", "error": "Connect Discord first"}
+        if not isinstance(content, str) or not content.strip():
+            return {"status": "failure", "error": "Provide reply text"}
+        async with self._send_lock:
+            if reply_to_id in self._replies:
+                return {"status": "success", "duplicate": True, "message_id": self._replies[reply_to_id]}
+            if channel_id not in self.allowed_channel_ids or not self.can_reply(channel_id, reply_to_id):
+                return {"status": "failure", "error": "Choose an accepted Discord mention in this channel"}
+            try:
+                channel = self.client.get_channel(int(channel_id))
+                if channel is None or str(channel.guild.id) not in self.allowed_guild_ids:
+                    return {"status": "failure", "error": "Choose a configured Discord server channel"}
+                source = await channel.fetch_message(int(reply_to_id))
+                request = self._requests[reply_to_id]
+                if (str(source.author.id), source.content) != request[1:] or source.author.bot:
+                    return {"status": "failure", "error": "The source message changed; send a fresh mention"}
+                content = content.strip()
+                if len(content) > 2000:
+                    content = content[:1999] + "…"
+                sent = await channel.send(
+                    content, reference=source,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    mention_author=False,
+                )
+            except Exception:
+                logger.error("Discord reply failed; check channel access")
+                return {"status": "failure", "error": "Discord reply failed; check channel access"}
+            self._replies[reply_to_id] = str(sent.id)
+            while len(self._replies) > 1000:
+                self._replies.popitem(last=False)
+            return {"status": "success", "message_id": str(sent.id)}

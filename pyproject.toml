@@ -20,6 +20,7 @@ google-genai = "^1.19.0"
 
 # --- Matrix Integration ---
 matrix-nio = {extras = ["e2e"], version = "^0.24.0"}
+"discord.py" = "^2.7.1"
 
 # --- Blockchain & Web3 ---
 web3 = "^6.15.1"

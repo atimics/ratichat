@@ -11,6 +11,7 @@ PUBLIC_BOT_ALLOWED_TOOLS = frozenset(
         "react_to_matrix_message",
         "send_farcaster_reply",
         "like_farcaster_post",
+        "send_discord_reply",
     }
 )
 
@@ -45,6 +46,7 @@ class CapabilityPolicy:
         control_room_id: str = "",
         operator_user_ids: Collection[str] = (),
         managed_room_ids: Collection[str] = (),
+        approved_discord_channel_ids: Collection[str] = (),
     ) -> None:
         normalized_profile = profile.strip().lower()
         if normalized_profile not in self.SUPPORTED_PROFILES:
@@ -53,6 +55,9 @@ class CapabilityPolicy:
                 f"Unknown bot capability profile '{profile}'. Supported profiles: {supported}"
             )
         self.profile = normalized_profile
+        self.approved_discord_channel_ids = frozenset(
+            value.strip() for value in approved_discord_channel_ids if value.strip()
+        )
         self.control_room_id = control_room_id
         self.operator_user_ids = frozenset(value.strip() for value in operator_user_ids if value.strip())
         self.managed_room_ids = frozenset(value.strip() for value in managed_room_ids if value.strip())
@@ -72,6 +77,8 @@ class CapabilityPolicy:
 
     def filter_tool_names(self, tool_names: Collection[str], execution_scope=None) -> set[str]:
         """Return the names that may be shown to and used by the model."""
+        if execution_scope and execution_scope.channel_type == "discord":
+            return set(tool_names) & {"wait", "send_discord_reply"}
         return {
             name for name in tool_names
             if self.allows(name) and (
@@ -137,6 +144,17 @@ class CapabilityPolicy:
                 f"Tool '{tool_name}' is blocked by the "
                 f"'{self.profile}' capability profile"
             )
+        if execution_scope and execution_scope.channel_type == "discord" and tool_name not in {"wait", "send_discord_reply"}:
+            return "Use a Discord reply for this request"
+        if tool_name == "send_discord_reply":
+            if not execution_scope or execution_scope.channel_type != "discord":
+                return "A current Discord mention is required"
+            channel_id = parameters.get("channel_id")
+            if channel_id not in self.approved_discord_channel_ids or channel_id != execution_scope.channel_id:
+                return "Choose the current configured Discord channel"
+            if not execution_scope.latest_event_id or parameters.get("reply_to_id") != execution_scope.latest_event_id:
+                return "Reply to the latest Discord mention"
+            return None
         if self.profile == "operator":
             return None
 

@@ -22,6 +22,7 @@ from ...integrations.farcaster import FarcasterObserver
 from ..node_system.node_manager import NodeManager
 from ...integrations.matrix.observer import MatrixObserver
 from ...integrations.telegram import TelegramObserver
+from ...integrations.discord import DiscordObserver
 from ...integrations.telegram.operator_queue import OperatorQueueBridge
 from ...integrations.base_nft_service import BaseNFTService
 from ...integrations.eligibility_service import UserEligibilityService
@@ -70,7 +71,21 @@ class TraditionalProcessor:
         """
         try:
             execution_scope = self.capability_policy.scope_from_payload(payload)
-            if self.capability_policy.profile == "matrix_steward":
+            if execution_scope.channel_type == "discord":
+                observer = getattr(self.action_context, "discord_observer", None)
+                if not self.ai_engine.api_key or not observer:
+                    return
+                if execution_scope.channel_id not in self.capability_policy.approved_discord_channel_ids:
+                    return
+                if not observer.can_reply(execution_scope.channel_id, execution_scope.latest_event_id):
+                    return
+                # Give each Discord request only its own channel's context.
+                payload = {
+                    "current_processing_channel_id": execution_scope.channel_id,
+                    "channels": {execution_scope.channel_id: payload["channels"][execution_scope.channel_id]},
+                    "cycle_id": payload.get("cycle_id"),
+                }
+            elif self.capability_policy.profile == "matrix_steward":
                 if not self.ai_engine.api_key:
                     return
                 if execution_scope.channel_id not in self.capability_policy.approved_matrix_room_ids:
@@ -90,7 +105,7 @@ class TraditionalProcessor:
             payload["available_tools"] = self.tool_registry.get_tool_descriptions_for_ai(
                 allowed_tool_names=allowed_tool_names
             )
-            if self.capability_policy.profile == "matrix_steward":
+            if self.capability_policy.profile == "matrix_steward" and execution_scope.channel_type == "matrix":
                 payload["matrix_management"] = {
                     "request_event_id": execution_scope.latest_event_id,
                     "managed_room_ids": sorted(self.capability_policy.managed_room_ids),
@@ -341,6 +356,7 @@ class MainOrchestrator:
             control_room_id=settings.MATRIX_CONTROL_ROOM_ID,
             operator_user_ids=settings.MATRIX_OPERATOR_USER_IDS.split(","),
             managed_room_ids=settings.MATRIX_MANAGED_ROOM_IDS.split(","),
+            approved_discord_channel_ids=settings.DISCORD_ALLOWED_CHANNEL_IDS.split(","),
         )
         
         # Core components
@@ -422,6 +438,7 @@ class MainOrchestrator:
         self.matrix_observer: Optional[MatrixObserver] = None
         self.farcaster_observer: Optional[FarcasterObserver] = None
         self.telegram_observer: Optional[TelegramObserver] = None
+        self.discord_observer: Optional[DiscordObserver] = None
         
         # NFT and eligibility services
         self.base_nft_service: Optional[BaseNFTService] = None
@@ -464,6 +481,7 @@ class MainOrchestrator:
             CreateAirdropClaimFrameTool,
         )
         from ...tools.telegram_tools import SendTelegramMessageTool, SendTelegramReplyTool
+        from ...tools.discord_tools import SendDiscordReplyTool
         from ...tools.matrix_tools import (
             AcceptMatrixInviteTool,
             IgnoreMatrixInviteTool,
@@ -530,6 +548,7 @@ class MainOrchestrator:
         # Telegram tools
         self.tool_registry.register_tool(SendTelegramMessageTool())
         self.tool_registry.register_tool(SendTelegramReplyTool())
+        self.tool_registry.register_tool(SendDiscordReplyTool())
 
         # Farcaster tools
         self.tool_registry.register_tool(SendFarcasterPostTool())
@@ -679,6 +698,9 @@ class MainOrchestrator:
         if self.telegram_observer:
             await self.telegram_observer.stop()
 
+        if self.discord_observer:
+            await self.discord_observer.stop()
+
         if hasattr(self, "telegram_operator_queue") and self.telegram_operator_queue:
             await self.telegram_operator_queue.stop()
 
@@ -818,10 +840,23 @@ class MainOrchestrator:
                     self.telegram_observer = None
                 logger.info("Continuing without Telegram integration")
 
+        if settings.DISCORD_BOT_TOKEN:
+            try:
+                self.discord_observer = DiscordObserver(self.world_state)
+                self.discord_observer.on_state_change = self.processing_hub.trigger_state_change
+                await self.discord_observer.start()
+                logger.info("Discord observer initialized and started")
+            except Exception:
+                logger.error("Discord setup needs a valid token, server IDs, and channel IDs")
+                if self.discord_observer:
+                    await self.discord_observer.stop()
+                self.discord_observer = None
+
         # Update action context with initialized observers
         self.action_context.matrix_observer = self.matrix_observer
         self.action_context.farcaster_observer = self.farcaster_observer
         self.action_context.telegram_observer = self.telegram_observer
+        self.action_context.discord_observer = self.discord_observer
         
         # Configure critical node pinning based on active integrations
         self._configure_critical_node_pinning()
