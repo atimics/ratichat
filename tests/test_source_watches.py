@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from chatbot.core.node_system.source_watches import HELP, SourceWatchService, WatchStore, _items
+from chatbot.core.node_system.source_watches import HELP, SourceWatchService, WatchStore, _digest, _items
 
 
 FEED = "https://example.com/releases.atom"
@@ -366,3 +366,162 @@ def test_two_services_share_job_lease_and_lookup_budget(tmp_path):
     assert second.claim() is None
     assert first.reserve_lookup(scope(), 1)
     assert second.reserve_lookup(scope(), 1) is False
+
+
+def prepare_uncertain(store, clock):
+    claimed = store.claim()
+    store.save_feed(claimed, _items(feed("v1"), FEED))
+    clock.advance()
+    claimed = store.claim()
+    prepared = store.save_feed(claimed, _items(feed("v2", "v1"), FEED))
+    store.begin_delivery(prepared)
+    store.reconcile_delivery(prepared["delivery_key"], "unknown")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_reconcile_failure_or_timeout_keeps_other_channel_work_running(tmp_path, timeout):
+    clock = Clock()
+    store = make_store(tmp_path, clock)
+    first = store.create(scope(), FEED, is_owner=True)
+    prepare_uncertain(store, clock)
+    store.create(scope("21"), FEED, is_owner=True)
+    async def blocked(*args):
+        await asyncio.Event().wait()
+    reconcile = AsyncMock(side_effect=blocked if timeout else RuntimeError("History lookup failed"))
+    fetch = AsyncMock(return_value=feed("v1"))
+    service = SourceWatchService(store, fetch=fetch, reconcile=reconcile, now=clock, callback_timeout=0.001)
+    await service.tick()
+    assert store.list(scope("21"))[0]["baseline"] == 1
+    assert store.list(scope())[0]["pending_status"] == "unknown"
+    assert store.list(scope())[0]["id"] == first["id"]
+    await service.tick()
+    reconcile.assert_awaited_once()
+    fetch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_send_failure_or_timeout_holds_receipt_and_runs_other_feeds(tmp_path, timeout):
+    clock = Clock()
+    store = make_store(tmp_path, clock)
+    first = store.create(scope(), FEED, is_owner=True)
+    claimed = store.claim()
+    store.save_feed(claimed, _items(feed("v1"), FEED))
+    clock.advance(3601)
+    store.create(scope("21"), FEED, is_owner=True)
+    async def blocked(*args):
+        await asyncio.Event().wait()
+    send = AsyncMock(side_effect=blocked if timeout else RuntimeError("Send outcome needs checking"))
+    fetch = AsyncMock(side_effect=[feed("v2", "v1"), feed("v1")])
+    service = SourceWatchService(store, fetch=fetch, send=send, now=clock, callback_timeout=0.001)
+    await service.tick()
+    assert store.list(scope("21"))[0]["baseline"] == 1
+    assert store.list(scope())[0]["pending_status"] == "unknown"
+    assert store.list(scope())[0]["id"] == first["id"]
+    send.assert_awaited_once()
+    assert fetch.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_uncertain_queue_reconciles_all_channels_fairly_after_restart(tmp_path):
+    clock = Clock()
+    store = make_store(tmp_path, clock)
+    watches = [store.create(scope("20" if number < 5 else "21", event=str(number)),
+                            f"https://example.com/{number}.atom", is_owner=True) for number in range(6)]
+    service, _, _ = make_service(store, clock, [feed("v1")] * 6 + [feed("v2", "v1")] * 6,
+                                  AsyncMock(return_value={"status": "unknown"}))
+    await service.tick()
+    await service.tick()
+    clock.advance()
+    await service.tick()
+    await service.tick()
+    assert len(store.uncertain_deliveries()) == 6
+    reconcile = AsyncMock(return_value={"status": "unknown"})
+    restart, fetch, _ = make_service(make_store(tmp_path, clock), clock, [], reconcile=reconcile)
+    await restart.tick()
+    await restart.tick()
+    assert {call.args[0] for call in reconcile.await_args_list} == {watch["id"] for watch in watches}
+    assert reconcile.await_count == 6
+    await restart.tick()
+    assert reconcile.await_count == 6
+    fetch.assert_not_awaited()
+
+
+def test_uncertain_queue_claims_are_shared_between_services(tmp_path):
+    clock = Clock()
+    first = make_store(tmp_path, clock)
+    first.create(scope(), FEED, is_owner=True)
+    prepare_uncertain(first, clock)
+    second = make_store(tmp_path, clock)
+    assert len(first.claim_uncertain()) == 1
+    assert second.claim_uncertain() == []
+    clock.advance(61)
+    assert len(second.claim_uncertain()) == 1
+
+
+def test_saved_watches_gain_reconciliation_fields_without_losing_state(tmp_path):
+    clock = Clock()
+    old = make_store(tmp_path, clock)
+    watch = old.create(scope(), FEED, is_owner=True)
+    with old._db() as db:
+        db.execute("ALTER TABLE source_watches DROP COLUMN reconcile_after")
+        db.execute("ALTER TABLE source_watches DROP COLUMN reconcile_attempts")
+    restored = make_store(tmp_path, clock)
+    row = restored.list(scope())[0]
+    assert row["id"] == watch["id"]
+    assert row["reconcile_after"] == 0 and row["reconcile_attempts"] == 0
+
+
+def test_link_escaping_is_counted_in_the_public_url_limit(tmp_path):
+    store = make_store(tmp_path, Clock())
+    expanding_url = "https://example.com/" + "(" * 970
+    with pytest.raises(ValueError, match="1000 characters"):
+        store.create(scope(), expanding_url, is_owner=True)
+    with pytest.raises(ValueError, match="1000 characters"):
+        _digest({"id": "example", "url": expanding_url}, [{"title": "Entry", "url": expanding_url}])
+    accepted_url = "https://example.com/" + "(" * 320
+    watch = store.create(scope(), accepted_url, is_owner=True)
+    digest = _digest(watch, [{"title": "Entry", "url": accepted_url}])
+    assert len(digest) <= 1900 and "%28" in digest
+
+
+@pytest.mark.asyncio
+async def test_watch_list_preserves_every_id_with_long_public_urls(tmp_path):
+    clock = Clock()
+    store = make_store(tmp_path, clock)
+    watches = [store.create(scope(event=str(number)), f"https://example.com/{number}/" + "x" * 940,
+                            is_owner=True) for number in range(5)]
+    text = await SourceWatchService(store).manage("watches", scope(event="list"), False)
+    assert all(watch["id"] in text for watch in watches)
+    assert len(text) < 1900 and "…" in text
+
+
+@pytest.mark.asyncio
+async def test_multi_watch_digest_keeps_complete_links_and_every_id(tmp_path):
+    clock = Clock()
+    store = make_store(tmp_path, clock)
+    watches = [store.create(scope(event=str(number)), f"https://example.com/{number}.atom", is_owner=True) for number in range(5)]
+    long_entry = {"status": "success", "url": FEED, "items": [{"title": "Release", "url": "https://example.com/" + "x" * 900}]}
+    service, _, _ = make_service(store, clock, [long_entry] * 5)
+    await service.tick()
+    text = await service.manage("digest", scope(event="digest"))
+    assert len(text) < 1900 and all(watch["id"] in text for watch in watches)
+    assert text.count("source links") == 5
+
+
+def test_redirected_feed_entries_with_feed_links_have_separate_keys():
+    canonical = "https://example.com/final.atom"
+    result = {"url": canonical, "items": [
+        {"title": "One", "published": "2026-10-01", "url": canonical},
+        {"title": "Two", "published": "2026-10-02", "url": canonical},
+        {"title": "Three", "published": "2026-10-02", "url": canonical},
+    ]}
+    assert len(_items(result, FEED)) == 3
+
+
+def test_feed_guids_keep_edited_entries_stable_after_a_redirect():
+    canonical = "https://example.com/final.atom"
+    first = {"url": canonical, "items": [{"title": "Original", "url": canonical, "id": "urn:entry:one"}]}
+    edit = {"url": canonical, "items": [{"title": "Edited", "url": canonical, "id": "urn:entry:one"}]}
+    assert _items(first, FEED)[0]["key"] == _items(edit, FEED)[0]["key"]
