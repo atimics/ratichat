@@ -373,6 +373,9 @@ class NodeProcessor:
                 for action in actions:
                     if action.action_type not in names:
                         continue
+                    if action.action_type == "wait" and any(path.startswith("sources.watch_result_") for path in sources):
+                        force_answer = True
+                        break
                     if turn and action.action_type in REPLY_TOOLS:
                         result = await self._save_and_send(action, scope, turn, sources)
                     else:

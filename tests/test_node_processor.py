@@ -400,6 +400,28 @@ def wire_watch_tools(processor):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("name,params", [
+    ("create_source_watch", {"url": "https://example.com/releases.atom", "interval_minutes": 60}),
+    ("list_source_watches", {}),
+])
+async def test_watch_tool_result_gets_a_reply_when_the_planner_waits(tmp_path, name, params):
+    processor, ai, tools = make_processor(tmp_path, [decision(plan(name, **params)), decision(plan("wait"))])
+    wire_watch_tools(processor)
+    ai.compose_reply.return_value = "The feed watch result is ready."
+    result = await processor.process_cycle("watch-confirmation", "20")
+    assert not result["failed"]
+    assert ai.make_decision.await_count == 2
+    ai.compose_reply.assert_awaited_once()
+    receipt = ai.compose_reply.await_args.args[0]["answer_nodes"]["sources.watch_result_1"]
+    assert receipt["tool"] == name and receipt["status"] == "success"
+    tools["wait"].execute.assert_not_awaited()
+    tools["send_discord_reply"].execute.assert_awaited_once()
+    reply = tools["send_discord_reply"].execute.await_args.args[0]
+    assert reply["channel_id"] == "20" and reply["reply_to_id"] == "40"
+    assert reply["content"].startswith("The feed watch result is ready.")
+
+
+@pytest.mark.asyncio
 async def test_agent_reads_watch_tool_result_before_it_replies(tmp_path):
     reply = plan("send_discord_reply", channel_id="20", reply_to_id="40", content="I will check the feed each hour.")
     processor, ai, tools = make_processor(tmp_path, [
