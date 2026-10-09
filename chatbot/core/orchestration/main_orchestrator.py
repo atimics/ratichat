@@ -33,7 +33,7 @@ from ..world_state.payload_builder import PayloadBuilder
 from .processing_hub import ProcessingHub, ProcessingConfig
 from .rate_limiter import RateLimiter, RateLimitConfig
 from ..proactive import ProactiveConversationEngine
-from .capability_policy import CapabilityPolicy, ExecutionScope, SOURCE_WATCH_TOOLS
+from .capability_policy import CapabilityPolicy, ExecutionScope, STATE_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,7 @@ class TraditionalProcessor:
             )
 
     def _tool_context(self, tool_name, execution_scope):
-        if tool_name not in SOURCE_WATCH_TOOLS:
+        if tool_name not in STATE_TOOLS:
             return self.action_context
         context = copy(self.action_context)
         context.execution_scope = execution_scope
@@ -306,7 +306,7 @@ class TraditionalProcessor:
             
         except Exception as e:
             logger.error(f"Error executing action {action.action_type}: {e}")
-            if action.action_type in SOURCE_WATCH_TOOLS and isinstance(result, dict):
+            if action.action_type in STATE_TOOLS and isinstance(result, dict):
                 # The store saved the change and receipt in one transaction.
                 return result
             # Log the failed action
@@ -455,6 +455,8 @@ class MainOrchestrator:
         self.steward_task = None
         self.source_watch_service = None
         self.source_watch_task = None
+        self.proactive_source_service = None
+        self.proactive_source_task = None
         
         # External observers
         self.matrix_observer: Optional[MatrixObserver] = None
@@ -555,6 +557,10 @@ class MainOrchestrator:
         self.tool_registry.register_tool(WebSearchTool())
         self.tool_registry.register_tool(ReadWebpageTool())
         self.tool_registry.register_tool(ReadFeedTool())
+        from ...tools.public_source_tools import ListPublicSourcesTool, ReadNewsTool, SearchSocialTool, ReadBlueskyFeedTool
+        from ...tools.proactive_source_tools import ConfigureProactiveTool, GetProactiveStatusTool
+        for tool in (ListPublicSourcesTool(), ReadNewsTool(), SearchSocialTool(), ReadBlueskyFeedTool(), ConfigureProactiveTool(), GetProactiveStatusTool()):
+            self.tool_registry.register_tool(tool)
         from ...tools.source_watch_tools import CreateSourceWatchTool, ListSourceWatchesTool, RemoveSourceWatchTool, GetSourceDigestTool
         for tool in (CreateSourceWatchTool(), ListSourceWatchesTool(), RemoveSourceWatchTool(), GetSourceDigestTool()):
             self.tool_registry.register_tool(tool)
@@ -674,6 +680,7 @@ class MainOrchestrator:
             # Set up processing hub with traditional processor
             self._setup_processing_components()
             self.source_watch_task = asyncio.create_task(self._source_watch_loop())
+            self.proactive_source_task = asyncio.create_task(self._proactive_source_loop())
             
             # Start the proactive conversation engine
             await self.proactive_engine.start()
@@ -701,6 +708,10 @@ class MainOrchestrator:
             self.source_watch_task.cancel()
             await asyncio.gather(self.source_watch_task, return_exceptions=True)
             self.source_watch_task = None
+        if self.proactive_source_task:
+            self.proactive_source_task.cancel()
+            await asyncio.gather(self.proactive_source_task, return_exceptions=True)
+            self.proactive_source_task = None
         if self.steward_task:
             self.steward_task.cancel()
             await asyncio.gather(self.steward_task, return_exceptions=True)
@@ -770,6 +781,13 @@ class MainOrchestrator:
             daily_lookup_budget=settings.SOURCE_WATCH_DAILY_LOOKUP_BUDGET)
         self.action_context.source_watch_service = self.source_watch_service
         node_processor.watch_service = self.source_watch_service
+        from ..node_system.proactive_sources import ProactiveStore, ProactiveSourceService
+        proactive_channels = {value.strip() for value in settings.PROACTIVE_DISCORD_CHANNEL_IDS.split(",") if value.strip()} & self.capability_policy.approved_discord_channel_ids
+        proactive_store = ProactiveStore(self.config.db_path, owner_ids["discord"], proactive_channels, settings.PROACTIVE_TIMEZONE)
+        for channel_id in proactive_channels:
+            proactive_store.seed(channel_id, enabled=settings.PROACTIVE_PUBLIC_SOURCES_ENABLED)
+        self.proactive_source_service = ProactiveSourceService(proactive_store, self.ai_engine, delivery, self.action_context)
+        self.action_context.proactive_source_service = self.proactive_source_service
         self.processing_hub.set_node_processor(node_processor)
 
     async def _source_watch_loop(self):
@@ -780,6 +798,16 @@ class MainOrchestrator:
                 raise
             except Exception:
                 logger.exception("Source watch check needs another attempt")
+            await asyncio.sleep(60)
+
+    async def _proactive_source_loop(self):
+        while self.running:
+            try:
+                await self.proactive_source_service.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Proactive source check needs another attempt")
             await asyncio.sleep(60)
 
     async def _initialize_nft_services(self) -> None:

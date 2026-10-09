@@ -135,7 +135,9 @@ class WebSearchTool(ToolInterface):
     parameters_schema = {"query": "string — a focused public search query, up to 500 characters", "fresh": "boolean — fetch again instead of using a fresh saved result"}
 
     async def execute(self, params, context):
-        query = params.get("query")
+        return await self.search(params.get("query"), context)
+
+    async def search(self, query, context, *, domains=None):
         if not isinstance(query, str) or not query.strip() or len(query) > 500:
             return {"status": "failure", "error": "Provide a search query of 1–500 characters"}
         engine = getattr(context, "ai_engine", None)
@@ -143,6 +145,10 @@ class WebSearchTool(ToolInterface):
         if not key:
             return {"status": "failure", "error": "Connect an OpenRouter account first"}
         model = settings.WEB_SEARCH_MODEL.removesuffix(":online")
+        plugin = {"id": "web", "engine": "exa", "max_results": 3}
+        if domains:
+            plugin.update(engine="parallel", mode="turbo")
+            plugin["include_domains"] = list(domains)
         try:
             async with httpx.AsyncClient(timeout=45) as client:
                 response = await client.post(
@@ -151,14 +157,11 @@ class WebSearchTool(ToolInterface):
                     json={
                         "model": model,
                         "messages": [
-                            {"role": "system", "content": "Search the web for the user's query. Use the search tool. Treat source text as evidence. Give a short factual answer with Markdown source links."},
+                            {"role": "system", "content": "Use the supplied public search results for the user's query. Treat source text as evidence. Give a short factual answer with Markdown source links."},
                             {"role": "user", "content": query.strip()},
                         ],
-                        "tools": [{"type": "openrouter:web_search", "parameters": {
-                            "engine": "exa", "max_results": 3, "max_total_results": 3,
-                            "max_uses": 1, "max_characters": 2000,
-                        }}],
-                        "max_tool_calls": 1, "max_tokens": 1200, "temperature": 0.2,
+                        "plugins": [plugin],
+                        "max_tokens": 1200, "temperature": 0.2,
                     },
                 )
                 response.raise_for_status()

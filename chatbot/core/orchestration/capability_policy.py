@@ -4,12 +4,16 @@ from dataclasses import dataclass
 from typing import Any, Collection, Mapping
 
 
-READ_ONLY_SOURCE_TOOLS = frozenset({"web_search", "read_webpage", "read_feed"})
+READ_ONLY_SOURCE_TOOLS = frozenset({"web_search", "read_webpage", "read_feed", "read_news", "list_public_sources", "search_social", "read_bluesky_feed"})
 WATCH_READ_TOOLS = frozenset({"list_source_watches", "get_source_digest"})
 WATCH_WRITE_TOOLS = frozenset({"create_source_watch", "remove_source_watch"})
 SOURCE_WATCH_TOOLS = WATCH_READ_TOOLS | WATCH_WRITE_TOOLS
+PROACTIVE_READ_TOOLS = frozenset({"get_proactive_status"})
+PROACTIVE_WRITE_TOOLS = frozenset({"configure_proactive"})
+PROACTIVE_SOURCE_TOOLS = PROACTIVE_READ_TOOLS | PROACTIVE_WRITE_TOOLS
+STATE_TOOLS = SOURCE_WATCH_TOOLS | PROACTIVE_SOURCE_TOOLS
 
-PUBLIC_BOT_ALLOWED_TOOLS = READ_ONLY_SOURCE_TOOLS | SOURCE_WATCH_TOOLS | frozenset(
+PUBLIC_BOT_ALLOWED_TOOLS = READ_ONLY_SOURCE_TOOLS | STATE_TOOLS | frozenset(
     {
         "wait",
         "send_matrix_reply",
@@ -85,15 +89,16 @@ class CapabilityPolicy:
     def filter_tool_names(self, tool_names: Collection[str], execution_scope=None) -> set[str]:
         """Return the names that may be shown to and used by the model."""
         if execution_scope and execution_scope.channel_type == "discord":
-            tool_names = set(tool_names) & ({"wait", "send_discord_reply"} | READ_ONLY_SOURCE_TOOLS | SOURCE_WATCH_TOOLS)
+            tool_names = set(tool_names) & ({"wait", "send_discord_reply"} | READ_ONLY_SOURCE_TOOLS | STATE_TOOLS)
         return {
             name for name in tool_names
             if self.allows(name) and (
                 self.profile != "matrix_steward"
                 or name not in MATRIX_MANAGEMENT_TOOLS
                 or self._operator_scope(execution_scope)
-            ) and (name not in SOURCE_WATCH_TOOLS or self._watch_scope(execution_scope))
-            and (name not in WATCH_WRITE_TOOLS or self._watch_owner_scope(execution_scope))
+            ) and (name not in STATE_TOOLS or self._watch_scope(execution_scope))
+            and (name not in PROACTIVE_SOURCE_TOOLS or execution_scope.channel_type == "discord")
+            and (name not in WATCH_WRITE_TOOLS | PROACTIVE_WRITE_TOOLS or self._watch_owner_scope(execution_scope))
         }
 
     def _watch_scope(self, scope: ExecutionScope | None) -> bool:
@@ -164,11 +169,13 @@ class CapabilityPolicy:
                 f"Tool '{tool_name}' is blocked by the "
                 f"'{self.profile}' capability profile"
             )
-        if tool_name in SOURCE_WATCH_TOOLS:
+        if tool_name in STATE_TOOLS:
             if not self._watch_scope(execution_scope):
                 return "Use a current request in a configured Discord or Matrix channel"
-            if tool_name in WATCH_WRITE_TOOLS and not self._watch_owner_scope(execution_scope):
-                return "The bot owner can add or remove source watches"
+            if tool_name in PROACTIVE_SOURCE_TOOLS and execution_scope.channel_type != "discord":
+                return "Use a configured Discord channel for proactive speaking"
+            if tool_name in WATCH_WRITE_TOOLS | PROACTIVE_WRITE_TOOLS and not self._watch_owner_scope(execution_scope):
+                return "The bot owner can change watch and proactive settings"
             if set(parameters) & {"channel_id", "channel_type", "sender_id", "event_id", "source_event_id", "is_owner"}:
                 return "Use the sender and channel from the current request"
             return None

@@ -1,6 +1,7 @@
 """Public address guards, feed parsing, and linked search credentials."""
 
 import asyncio
+import json
 import socket
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -144,8 +145,26 @@ async def test_search_uses_live_linked_key_and_returns_citations():
     with patch("chatbot.tools.web_tools.httpx.AsyncClient", return_value=client):
         result = await WebSearchTool().execute({"query": "public topic"}, SimpleNamespace(ai_engine=SimpleNamespace(api_key="linked-key")))
     assert calls[0].headers["Authorization"] == "Bearer linked-key"
+    payload = json.loads(calls[0].content)
+    assert payload["plugins"] == [{"id": "web", "engine": "exa", "max_results": 3}]
+    assert "tools" not in payload
     assert result["sources"][0]["url"] == "https://example.com/source"
     assert "linked-key" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_social_search_sends_a_search_engine_domain_filter():
+    calls = []
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "public facts", "annotations": [
+            {"type": "url_citation", "url_citation": {"url": "https://www.reddit.com/r/Python/comments/one", "content": "evidence"}},
+        ]}}]})
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    with patch("chatbot.tools.web_tools.httpx.AsyncClient", return_value=client):
+        result = await WebSearchTool().search("Python releases", SimpleNamespace(ai_engine=SimpleNamespace(api_key="linked-key")), domains=("reddit.com",))
+    assert result["status"] == "success"
+    assert json.loads(calls[0].content)["plugins"] == [{"id": "web", "engine": "parallel", "mode": "turbo", "max_results": 3, "include_domains": ["reddit.com"]}]
 
 
 @pytest.mark.asyncio

@@ -82,6 +82,9 @@ class AppConfig(BaseSettings):
     RESEARCH_RETENTION_DAYS: int = 7
     RESEARCH_SOURCE_TTL_SECONDS: int = 300
     SOURCE_WATCH_DAILY_LOOKUP_BUDGET: int = 24
+    PROACTIVE_DISCORD_CHANNEL_IDS: str = ""
+    PROACTIVE_PUBLIC_SOURCES_ENABLED: bool = False
+    PROACTIVE_TIMEZONE: str = "America/Vancouver"
 
     # Telegram
     TELEGRAM_BOT_TOKEN: Optional[str] = None

@@ -10,7 +10,7 @@ import time
 
 from ...config import settings
 from ..ai_engine import ActionPlan
-from ..orchestration.capability_policy import READ_ONLY_SOURCE_TOOLS, SOURCE_WATCH_TOOLS
+from ..orchestration.capability_policy import READ_ONLY_SOURCE_TOOLS, SOURCE_WATCH_TOOLS, PROACTIVE_SOURCE_TOOLS, STATE_TOOLS
 from .interaction_tools import NodeInteractionTools
 from .node_manager import NodeManager
 from .research_store import ResearchStore
@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 NODE_TOOLS = frozenset({"expand_node", "collapse_node", "pin_node", "unpin_node", "get_expansion_status"})
 MANAGEMENT_TOOLS = frozenset({"manage_matrix_room", "manage_matrix_server", "matrix_server_status"})
 REPLY_TOOLS = frozenset({"send_discord_reply", "send_matrix_reply", "send_farcaster_reply"})
+STATE_RESULT_PREFIXES = ("sources.watch_result_", "sources.proactive_result_")
 
 
 def capture_request(world_state, policy, store, channel_id, message, *, accepted=False):
@@ -159,7 +160,7 @@ class NodeProcessor:
         text = str(action.parameters.get("content", "")).strip()[:1900]
         if not text:
             return {"status": "blocked", "error": "Provide reply text"}
-        records = [data for path, data in sources.items() if path.startswith(("sources.result_", "sources.watch_result_"))]
+        records = [data for path, data in sources.items() if path.startswith(("sources.result_", *STATE_RESULT_PREFIXES))]
         if not self.research_store.ready(turn["id"], turn["lease_token"], text, sources=records):
             return {"status": "blocked", "error": "The saved turn needs a current claim"}
         delivery = self.research_store.claim_delivery(turn["platform"], turn["channel_id"], lease_seconds=900)
@@ -250,6 +251,8 @@ class NodeProcessor:
             "sources.web": {"description": "Search current public web information with web_search."},
             "sources.pages": {"description": "Read public pages, project docs, or raw GitHub files with read_webpage."},
             "sources.feeds": {"description": "Read news, blogs, or GitHub release RSS/Atom feeds with read_feed."},
+            "sources.news": {"description": "Use read_news for BBC News, BBC Technology, Hacker News, and CoinDesk headlines."},
+            "sources.social": {"description": "Use search_social for indexed public Reddit, Farcaster, X, or Bluesky pages and posts. Use read_bluesky_feed for a public author feed."},
         }
         if turn:
             sources["channel.memory"] = self.research_store.memory_node(channel.type, channel.id)
@@ -260,24 +263,35 @@ class NodeProcessor:
         scope_payload = self.payload_builder.build_request_node_payload(channel, self.node_manager)
         channel_node = scope_payload["expanded_nodes"][channel_path]["data"]
         scope = self.policy.scope_from_payload(scope_payload)
+        proactive = getattr(self.executor.action_context, "proactive_source_service", None)
+        proactive_scope = {"channel_type": scope.channel_type, "channel_id": scope.channel_id,
+                           "sender_id": scope.latest_sender_id, "event_id": scope.latest_event_id}
+        proactive_available = proactive and scope.channel_type == "discord" and scope.channel_id in proactive.store.allowed_channels
+        if proactive_available:
+            sources["sources.proactive"] = proactive.store.status(proactive_scope)
         if turn:
-            saved_watch_results = [data for data in turn["sources"] if data.get("tool") in SOURCE_WATCH_TOOLS]
+            saved_watch_results = [data for data in turn["sources"] if data.get("tool") in STATE_TOOLS]
             if self.watch_service:
                 trusted_scope = {"channel_type": scope.channel_type, "channel_id": scope.channel_id,
                                  "sender_id": scope.latest_sender_id, "event_id": scope.latest_event_id}
                 for data in self.watch_service.store.tool_results(trusted_scope):
                     if data not in saved_watch_results:
                         saved_watch_results.append(data)
+            if proactive_available:
+                for data in proactive.store.tool_results(proactive_scope):
+                    if data not in saved_watch_results:
+                        saved_watch_results.append(data)
             for index, data in enumerate(saved_watch_results, 1):
-                path = "sources.watch_result_" + str(index)
+                prefix = "sources.proactive_result_" if data["tool"] in PROACTIVE_SOURCE_TOOLS else "sources.watch_result_"
+                path = prefix + str(index)
                 sources[path] = data
                 self.node_manager.expand_node(path)
         allowed = self.policy.filter_tool_names(self.executor.tool_registry.get_tool_names(), scope)
         if turn:
-            allowed &= READ_ONLY_SOURCE_TOOLS | SOURCE_WATCH_TOOLS | REPLY_TOOLS | MANAGEMENT_TOOLS | {"wait"}
+            allowed &= READ_ONLY_SOURCE_TOOLS | STATE_TOOLS | REPLY_TOOLS | MANAGEMENT_TOOLS | {"wait"}
         lookups, executed = 0, 0
         results = [{"tool": data["tool"], "node_path": path, "result": data}
-                   for path, data in sources.items() if path.startswith("sources.watch_result_")]
+                   for path, data in sources.items() if path.startswith(STATE_RESULT_PREFIXES)]
         seen_lookups = set()
         force_answer = False
         try:
@@ -336,14 +350,15 @@ class NodeProcessor:
                 if not actions:
                     force_answer = True
                     continue
-                watch_actions = [action for action in actions if action.action_type in SOURCE_WATCH_TOOLS]
+                watch_actions = [action for action in actions if action.action_type in STATE_TOOLS]
                 if watch_actions:
                     for action in watch_actions:
                         result = await self.executor._execute_action_and_return_result(action, scope)
-                        path = "sources.watch_result_" + str(1 + sum(key.startswith("sources.watch_result_") for key in sources))
+                        prefix = "sources.proactive_result_" if action.action_type in PROACTIVE_SOURCE_TOOLS else "sources.watch_result_"
+                        path = prefix + str(1 + sum(key.startswith(STATE_RESULT_PREFIXES) for key in sources))
                         sources[path] = {"tool": action.action_type, "trust": "untrusted_source", **result}
                         if turn:
-                            records = [data for key, data in sources.items() if key.startswith("sources.watch_result_")]
+                            records = [data for key, data in sources.items() if key.startswith(STATE_RESULT_PREFIXES)]
                             if not self.research_store.save_sources(turn["id"], turn["lease_token"], records):
                                 return self._result(executed, lookups, step + 1, failed=True)
                         self.node_manager.expand_node(path)
@@ -351,6 +366,8 @@ class NodeProcessor:
                         executed += 1
                     if self.watch_service and channel.type in {"discord", "matrix"}:
                         sources["sources.watches"] = self._watch_node(channel)
+                    if proactive_available:
+                        sources["sources.proactive"] = proactive.store.status(proactive_scope)
                     # The next AI step sees the actual result before writing its reply.
                     continue
                 # A reply selected alongside a lookup is based on stale context.
@@ -390,7 +407,7 @@ class NodeProcessor:
                 for action in actions:
                     if action.action_type not in names:
                         continue
-                    if action.action_type == "wait" and any(path.startswith("sources.watch_result_") for path in sources):
+                    if action.action_type == "wait" and any(path.startswith(STATE_RESULT_PREFIXES) for path in sources):
                         force_answer = True
                         break
                     if turn and action.action_type in REPLY_TOOLS:
