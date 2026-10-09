@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from chatbot.core.ai_engine import ActionPlan, DecisionResult
-from chatbot.core.node_system.processor import NodeProcessor
+from chatbot.core.node_system.processor import NodeProcessor, capture_request
 from chatbot.core.orchestration.capability_policy import CapabilityPolicy
 from chatbot.core.orchestration.main_orchestrator import TraditionalProcessor
 from chatbot.core.orchestration.processing_hub import ProcessingHub
@@ -106,14 +106,14 @@ async def test_repeated_state_and_restart_keep_paid_request_single_use(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_source_results_are_cleared_for_a_new_request(tmp_path):
+async def test_new_request_keeps_saved_sources_in_its_channel_memory(tmp_path):
     processor, ai, tools = make_processor(tmp_path, [
         decision(plan("web_search", query="topic")), decision(plan("wait")), decision(plan("wait")),
     ])
     await processor.process_cycle("first", "20")
     processor.world_state.add_message("20", Message("41", "discord", "60", "new request", time.time()))
     await processor.process_cycle("second", "20")
-    assert "public evidence" not in json.dumps(processor.last_payload)
+    assert "public evidence" in json.dumps(processor.last_payload["expanded_nodes"]["channel.memory"])
     assert "sources.result_1" not in processor.node_manager.node_metadata
 
 
@@ -272,8 +272,20 @@ async def test_empty_decision_gets_an_answer_step(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_final_answer_failure_sends_a_factual_error_reply(tmp_path):
+async def test_final_answer_failure_waits_for_a_saved_retry(tmp_path):
     processor, ai, tools = make_processor(tmp_path, [decision()])
+    ai.compose_reply.return_value = None
+    result = await processor.process_cycle("test", "20")
+    assert result["failed"]
+    tools["send_discord_reply"].execute.assert_not_awaited()
+    assert processor.research_store.state_counts()["queued"] == 1
+    assert not processor.pending_channels()
+
+
+@pytest.mark.asyncio
+async def test_final_answer_last_attempt_sends_a_factual_error_reply(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [decision()])
+    processor.research_store.max_attempts = 1
     ai.compose_reply.return_value = None
     result = await processor.process_cycle("test", "20")
     assert result["failed"]
@@ -290,3 +302,86 @@ async def test_final_answer_uses_trusted_target_after_bad_model_target(tmp_path)
     tools["send_discord_reply"].execute.assert_awaited_once()
     reply = tools["send_discord_reply"].execute.await_args.args[0]
     assert reply["channel_id"] == "20" and reply["reply_to_id"] == "40"
+
+
+@pytest.mark.asyncio
+async def test_burst_intake_keeps_each_request_and_original_target(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [decision() for _ in range(5)])
+    capture_request(processor.world_state, processor.policy, processor.research_store, "20",
+                    processor.world_state.get_channel("20").recent_messages[-1], accepted=True)
+    processor.world_state.on_message_added = lambda channel_id, message: capture_request(
+        processor.world_state, processor.policy, processor.research_store, channel_id, message,
+    )
+    for number in range(41, 45):
+        processor.world_state.add_message("20", Message(str(number), "discord", "50", "request " + str(number),
+            time.time(), channel_id="20", metadata={"bot_mentioned": True}))
+    # Intake captures the burst before any AI step. The live history may grow later.
+    for _ in range(5):
+        await processor.process_cycle("burst", "20")
+    replies = [call.args[0]["reply_to_id"] for call in tools["send_discord_reply"].execute.await_args_list]
+    assert replies == ["40", "41", "42", "43", "44"]
+    assert processor.research_store.state_counts() == {"sent": 5}
+
+
+@pytest.mark.asyncio
+async def test_source_cache_is_scoped_and_fresh_requests_fetch_again(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [
+        decision(plan("web_search", query="topic")), decision(),
+        decision(plan("web_search", query="topic")), decision(),
+        decision(plan("web_search", query="topic", fresh=True)), decision(),
+    ])
+    for number in range(40, 43):
+        if number > 40:
+            processor.world_state.add_message("20", Message(str(number), "discord", "50", "follow-up", time.time()))
+        await processor.process_cycle("cache", "20")
+    assert tools["web_search"].execute.await_count == 2
+    assert "fresh" not in tools["web_search"].execute.await_args.args[0]
+    memory = processor.research_store.memory_node("discord", "20")
+    assert len(memory["turns"]) == 3
+    assert ai.compose_reply.return_value in json.dumps(memory)
+    assert "public evidence" in json.dumps(memory)
+    assert processor.research_store.memory_node("matrix", "!private:example.com")["turns"] == []
+
+
+@pytest.mark.asyncio
+async def test_restart_uses_snapshot_even_with_empty_live_world(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [decision()])
+    source = processor.world_state.get_channel("20").recent_messages[-1]
+    capture_request(processor.world_state, processor.policy, processor.research_store, "20", source, accepted=True)
+    restarted = NodeProcessor(WorldStateManager(), processor.payload_builder, processor.executor, processor.db_path)
+    assert restarted.pending_channels() == ["20"]
+    await restarted.process_cycle("restart", "20")
+    reply = tools["send_discord_reply"].execute.await_args.args[0]
+    assert reply["reply_to_id"] == "40"
+    assert reply["delivery_id"].startswith("research:")
+    assert restarted.research_store.state_counts() == {"sent": 1}
+
+
+@pytest.mark.asyncio
+async def test_uncertain_send_uses_receipt_before_any_further_send(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [decision()])
+    tools["send_discord_reply"].execute.return_value = {"status": "unknown"}
+    await processor.process_cycle("send", "20")
+    assert processor.research_store.state_counts() == {"uncertain": 1}
+    observer = processor.executor.action_context.discord_observer
+    observer.reconcile_reply = AsyncMock(return_value={"status": "success", "message_id": "sent-123"})
+    processor._last_receipt_check.clear()
+    await processor.process_cycle("check", "20")
+    assert processor.research_store.state_counts() == {"sent": 1}
+    tools["send_discord_reply"].execute.assert_awaited_once()
+    ai.make_decision.assert_awaited_once()
+    observer.reconcile_reply.assert_awaited_once_with("20", "40", ai.compose_reply.return_value)
+
+
+@pytest.mark.asyncio
+async def test_traditional_mode_keeps_future_retry_in_saved_queue(tmp_path):
+    processor, ai, _ = make_processor(tmp_path, [RuntimeError("temporary model error")])
+    await processor.process_cycle("first", "20")
+    hub = ProcessingHub(processor.world_state, processor.payload_builder, Mock())
+    hub.set_node_processor(processor)
+    traditional = SimpleNamespace(process_payload=AsyncMock())
+    hub.set_traditional_processor(traditional)
+    await hub._process_with_traditional_strategy(["20"])
+    traditional.process_payload.assert_not_awaited()
+    ai.make_decision.assert_awaited_once()
+    assert processor.research_store.state_counts() == {"queued": 1}

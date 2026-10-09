@@ -82,6 +82,7 @@ async def get_system_status(orchestrator: MainOrchestrator = Depends(get_orchest
             "rate_limits": rate_limit_status,
             "integrations": integration_status,
             "processing": processing_status,
+            "research": orchestrator.research_store.state_counts() if hasattr(orchestrator, "research_store") else {},
             "uptime_seconds": (datetime.now() - orchestrator.start_time).total_seconds() if hasattr(orchestrator, 'start_time') else 0
         }
         

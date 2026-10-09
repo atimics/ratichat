@@ -34,6 +34,40 @@ async def test_send_matrix_reply_tool_success():
     assert result["event_id"] == "evt123"
     dummy_obs.send_reply.assert_awaited_once_with("!room:server", "Hello!", "origevt")
 
+
+@pytest.mark.asyncio
+async def test_saved_matrix_reply_keeps_text_and_transaction_together():
+    observer = Mock()
+    observer.send_reply = AsyncMock(return_value={"success": True, "event_id": "evt123"})
+    observer.send_image = AsyncMock()
+    world = WorldStateManager()
+    world.get_last_generated_media_url = Mock(return_value="https://example.com/other-room.png")
+    world.state.generated_media_library = [{"timestamp": time.time()}]
+    result = await SendMatrixReplyTool().execute({
+        "channel_id": "!room:server", "content": "Saved answer", "reply_to_id": "source",
+        "format_as_markdown": False, "delivery_id": "research:1",
+    }, ActionContext(matrix_observer=observer, world_state_manager=world))
+    assert result["event_id"] == "evt123"
+    observer.send_reply.assert_awaited_once_with("!room:server", "Saved answer", "source", tx_id="research:1")
+    observer.send_image.assert_not_awaited()
+    world.get_last_generated_media_url.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_saved_matrix_transport_error_keeps_transaction_for_receipt_check():
+    observer = MatrixObserver("https://example.com", "@bot:example.com", "unused", WorldStateManager())
+    observer.client = Mock()
+    observer.client.room_send = AsyncMock(side_effect=[TimeoutError("lost response"), nio.RoomSendResponse("$sent", "!room:server")])
+    context = ActionContext(matrix_observer=observer)
+    params = {"channel_id": "!room:server", "content": "Saved answer", "reply_to_id": "$source",
+              "format_as_markdown": False, "delivery_id": "research:9"}
+    first = await SendMatrixReplyTool().execute(params, context)
+    assert first["status"] == "unknown"
+    receipt = await observer.send_reply("!room:server", "Saved answer", "$source", tx_id="research:9")
+    assert receipt["event_id"] == "$sent"
+    assert observer.reply_receipts["research:9"]["event_id"] == "$sent"
+    assert {call.kwargs["tx_id"] for call in observer.client.room_send.await_args_list} == {"research:9"}
+
 @pytest.mark.asyncio
 async def test_send_matrix_reply_tool_missing_params():
     dummy_obs = type("DummyObs", (), {})()

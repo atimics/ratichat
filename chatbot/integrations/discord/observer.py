@@ -1,6 +1,7 @@
 """Receive bot mentions and send replies in configured Discord channels."""
 
 import asyncio
+import hashlib
 import logging
 from collections import OrderedDict
 
@@ -156,12 +157,41 @@ class DiscordObserver(Integration):
             sender=str(message.author.id), sender_display_name=message.author.display_name,
             sender_username=message.author.name, content=content,
             timestamp=message.created_at.timestamp(),
-            metadata={"guild_id": guild_id, "bot_mentioned": True},
+            metadata={"guild_id": guild_id, "bot_mentioned": True, "raw_content": message.content},
         ))
         if self.on_state_change:
             self.on_state_change()
 
-    async def send_reply(self, channel_id, content, reply_to_id):
+    def restore_request(self, channel_id, source):
+        """Restore an accepted mention from its saved intake record."""
+        if (channel_id in self.allowed_channel_ids
+                and source.get("metadata", {}).get("guild_id") in self.allowed_guild_ids
+                and source.get("metadata", {}).get("bot_mentioned")):
+            raw = source["metadata"].get("raw_content", source["content"])
+            self._requests[source["id"]] = (channel_id, source["sender"], raw)
+
+    async def reconcile_reply(self, channel_id, reply_to_id, content):
+        """Find the actual bot reply after a send lost its response."""
+        if reply_to_id in self._replies:
+            return {"status": "success", "message_id": self._replies[reply_to_id]}
+        if not self.client or not self.client.is_ready() or channel_id not in self.allowed_channel_ids:
+            return {"status": "unknown"}
+        channel = self.client.get_channel(int(channel_id))
+        if not channel or str(channel.guild.id) not in self.allowed_guild_ids:
+            return {"status": "unknown"}
+        try:
+            async for message in channel.history(limit=100, after=discord.Object(id=int(reply_to_id)), oldest_first=True):
+                reference = getattr(message, "reference", None)
+                if (message.author.id == self.client.user.id
+                        and reference and str(reference.message_id) == reply_to_id
+                        and message.content == content):
+                    self._replies[reply_to_id] = str(message.id)
+                    return {"status": "success", "message_id": str(message.id)}
+        except Exception:
+            logger.warning("Discord reply receipt needs another check")
+        return {"status": "unknown"}
+
+    async def send_reply(self, channel_id, content, reply_to_id, delivery_id=None):
         channel_id, reply_to_id = str(channel_id), str(reply_to_id)
         if not self.client or not self.client.is_ready():
             return {"status": "failure", "error": "Connect Discord first"}
@@ -171,15 +201,20 @@ class DiscordObserver(Integration):
             if reply_to_id in self._replies:
                 return {"status": "success", "duplicate": True, "message_id": self._replies[reply_to_id]}
             if channel_id not in self.allowed_channel_ids or not self.can_reply(channel_id, reply_to_id):
-                return {"status": "failure", "error": "Choose an accepted Discord mention in this channel"}
+                return {"status": "failure", "retryable": False, "error": "Choose an accepted Discord mention in this channel"}
             try:
                 channel = self.client.get_channel(int(channel_id))
                 if channel is None or str(channel.guild.id) not in self.allowed_guild_ids:
-                    return {"status": "failure", "error": "Choose a configured Discord server channel"}
-                source = await channel.fetch_message(int(reply_to_id))
+                    return {"status": "failure", "retryable": False, "error": "Choose a configured Discord server channel"}
+                try:
+                    source = await channel.fetch_message(int(reply_to_id))
+                except (discord.Forbidden, discord.NotFound):
+                    return {"status": "failure", "retryable": False, "error": "Check the source message and channel access"}
+                except Exception:
+                    return {"status": "failure", "retryable": True, "error": "The source message needs another fetch"}
                 request = self._requests[reply_to_id]
                 if (str(source.author.id), source.content) != request[1:] or source.author.bot:
-                    return {"status": "failure", "error": "The source message changed; send a fresh mention"}
+                    return {"status": "failure", "retryable": False, "error": "The source message changed; send a fresh mention"}
                 content = content.strip()
                 if len(content) > 2000:
                     content = content[:1999] + "…"
@@ -187,10 +222,16 @@ class DiscordObserver(Integration):
                     content, reference=source,
                     allowed_mentions=discord.AllowedMentions.none(),
                     mention_author=False,
+                    **({"nonce": hashlib.sha256(delivery_id.encode()).hexdigest()[:24]} if delivery_id else {}),
                 )
+            except (discord.Forbidden, discord.NotFound):
+                return {"status": "failure", "retryable": False, "error": "Check the source message and channel access"}
+            except discord.HTTPException as error:
+                status = "failure" if error.status < 500 else "unknown"
+                return {"status": status, "retryable": error.status == 429, "error": "Discord needs another delivery attempt"}
             except Exception:
                 logger.error("Discord reply failed; check channel access")
-                return {"status": "failure", "error": "Discord reply failed; check channel access"}
+                return {"status": "unknown", "error": "Discord delivery needs a receipt check"}
             self._replies[reply_to_id] = str(sent.id)
             while len(self._replies) > 1000:
                 self._replies.popitem(last=False)

@@ -62,6 +62,8 @@ class MatrixObserver(Integration):
         self.client: Optional[AsyncClient] = None
         self.sync_task: Optional[asyncio.Task] = None
         self.channels_to_monitor = []
+        self.intake_started_at = time.time()
+        self.reply_receipts = {}
 
         # Create store directory for Matrix client data
         self.store_path = Path("matrix_store")
@@ -368,6 +370,9 @@ class MatrixObserver(Integration):
         metadata = {
             "matrix_event_type": getattr(event, "msgtype", type(event).__name__)
         }
+        server_time = getattr(event, "server_timestamp", None)
+        if isinstance(server_time, (int, float)):
+            metadata["historical"] = server_time / 1000 < self.intake_started_at
         
         # Add original filename to metadata for image messages if available
         if isinstance(event, RoomMessageImage) and 'image_filename' in locals() and image_filename:
@@ -867,7 +872,7 @@ class MatrixObserver(Integration):
             return {"success": False, "error": str(e)}
 
     async def send_reply(
-        self, room_id: str, content: str, reply_to_event_id: str
+        self, room_id: str, content: str, reply_to_event_id: str, tx_id: str = None
     ) -> Dict[str, Any]:
         """Send a reply to a specific message in a Matrix room"""
         logger.info(
@@ -900,6 +905,7 @@ class MatrixObserver(Integration):
                     room_id=room_id,
                     message_type="m.room.message",
                     content=reply_content,
+                    **({"tx_id": tx_id} if tx_id else {}),
                 )
 
                 logger.info(
@@ -910,6 +916,10 @@ class MatrixObserver(Integration):
                     logger.info(
                         f"MatrixObserver: Sent reply to {room_id} (event: {response.event_id}, reply_to: {reply_to_event_id})"
                     )
+                    if tx_id:
+                        self.reply_receipts[tx_id] = {"event_id": response.event_id, "room_id": room_id}
+                        if len(self.reply_receipts) > 1000:
+                            self.reply_receipts.pop(next(iter(self.reply_receipts)))
                     return {
                         "success": True,
                         "event_id": response.event_id,
@@ -973,7 +983,7 @@ class MatrixObserver(Integration):
             logger.error(
                 f"MatrixObserver: Exception while sending reply: {e}", exc_info=True
             )
-            return {"success": False, "error": f"Exception: {str(e)}"}
+            return {"success": False, "status": "unknown" if tx_id else "failure", "error": f"Exception: {str(e)}"}
 
     async def send_formatted_message(
         self, room_id: str, plain_content: str, html_content: str
@@ -1084,6 +1094,7 @@ class MatrixObserver(Integration):
         plain_content: str,
         html_content: str,
         reply_to_event_id: str,
+        tx_id: str = None,
     ) -> Dict[str, Any]:
         """Send a formatted reply with both plain text and HTML versions."""
         logger.info(
@@ -1115,7 +1126,8 @@ class MatrixObserver(Integration):
             max_retries = 3
             for attempt in range(max_retries):
                 response = await self.client.room_send(
-                    room_id=room_id, message_type="m.room.message", content=content
+                    room_id=room_id, message_type="m.room.message", content=content,
+                    **({"tx_id": tx_id} if tx_id else {}),
                 )
 
                 logger.info(
@@ -1126,6 +1138,10 @@ class MatrixObserver(Integration):
                     logger.info(
                         f"MatrixObserver: Successfully sent formatted reply to {room_id} (event: {response.event_id}, reply_to: {reply_to_event_id})"
                     )
+                    if tx_id:
+                        self.reply_receipts[tx_id] = {"event_id": response.event_id, "room_id": room_id}
+                        if len(self.reply_receipts) > 1000:
+                            self.reply_receipts.pop(next(iter(self.reply_receipts)))
                     return {
                         "success": True,
                         "event_id": response.event_id,

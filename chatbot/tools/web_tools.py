@@ -132,7 +132,7 @@ def page_text(content):
 class WebSearchTool(ToolInterface):
     name = "web_search"
     description = "Search the public web for current facts, news, or project docs. Results include source links. Read the result before replying and cite its links."
-    parameters_schema = {"query": "string — a focused public search query, up to 500 characters"}
+    parameters_schema = {"query": "string — a focused public search query, up to 500 characters", "fresh": "boolean — fetch again instead of using a fresh saved result"}
 
     async def execute(self, params, context):
         query = params.get("query")
@@ -183,7 +183,7 @@ class WebSearchTool(ToolInterface):
 class ReadWebpageTool(ToolInterface):
     name = "read_webpage"
     description = "Read text from a public page, project document, or public GitHub URL. Provide a raw GitHub URL for source files. Cite the returned URL."
-    parameters_schema = {"url": "string — public HTTP or HTTPS page URL"}
+    parameters_schema = {"url": "string — public HTTP or HTTPS page URL", "fresh": "boolean — fetch again instead of using a fresh saved result"}
 
     async def execute(self, params, context):
         try:
@@ -204,7 +204,7 @@ class ReadWebpageTool(ToolInterface):
 class ReadFeedTool(ToolInterface):
     name = "read_feed"
     description = "Read the ten latest entries from a public RSS or Atom feed, including news, blogs, and GitHub release feeds. Cite the entry links."
-    parameters_schema = {"url": "string — public RSS or Atom feed URL"}
+    parameters_schema = {"url": "string — public RSS or Atom feed URL", "fresh": "boolean — fetch again instead of using a fresh saved result"}
 
     async def execute(self, params, context):
         try:
