@@ -313,3 +313,62 @@ async def test_chat_activity_during_routing_preserves_original_event_evidence(tm
     assert saved["accepted"]
     store.delete_message("discord", "general", "d1")
     assert store.get_task(binding.task["id"])["status"] == "needs_refresh"
+
+
+@pytest.mark.asyncio
+async def test_exact_task_reference_resumes_saved_route_during_jev_outage(tmp_path):
+    processor, service, store, ai, sends = setup(tmp_path)
+    source = message(processor, store, "discord", "general", "owner", "d1", "Research the Python project")
+    binding = await service.prepare(processor.world_state.get_channel("general"), source)
+    source = message(processor, store, "matrix", "!public:test", "@owner:test", "$m1", "Continue " + binding.task["id"])
+    service.router.select_route = AsyncMock(side_effect=AssertionError("Saved exact route handles this continuation"))
+    continued = await service.prepare(processor.world_state.get_channel("!public:test"), source)
+    assert continued.task["id"] == binding.task["id"]
+    assert continued.route == binding.route
+    service.router.select_route.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_jev_continuation_choices_include_saved_work_and_skip_placeholder(tmp_path):
+    from tests.test_model_router import catalog, answer_body
+    processor, service, store, ai, sends = setup(tmp_path)
+    source = message(processor, store, "discord", "general", "owner", "d1", "Research Python")
+    first = await service.prepare(processor.world_state.get_channel("general"), source)
+    source = message(processor, store, "matrix", "!public:test", "@owner:test", "$m1", "Continue the Python project")
+    def respond(request):
+        body = json.loads(request.content)
+        choices = body["questions"]["task"]["criteria"]
+        saved = [value for key, value in choices.items() if key != "new"]
+        assert [value["id"] for value in saved] == [first.task["id"]]
+        assert body["session_id"] != first.task["id"]
+        return httpx.Response(200, json=answer_body(request, task="task0"))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        service.router = ModelRouter("key", client=client, catalog=catalog())
+        continued = await service.prepare(processor.world_state.get_channel("!public:test"), source)
+    assert continued.task["id"] == first.task["id"]
+
+
+def test_collapsed_nodes_keep_current_project_evidence(tmp_path):
+    processor, service, store, ai, sends = setup(tmp_path)
+    message(processor, store, "discord", "general", "owner", "d1", "Our shared project uses Python 3.14")
+    node = store.catalog("matrix", "!public:test", "@owner:test")["channels.discord.general"]
+    assert "Python 3.14" in node["summary"]
+    assert node["summary_version"] == node["version"]
+    store.edit_message("discord", "general", "d1", {"content": "Our shared project uses Python 3.15"})
+    node = store.catalog("matrix", "!public:test", "@owner:test")["channels.discord.general"]
+    assert "Python 3.15" in node["summary"]
+    assert "Python 3.14" not in node["summary"]
+
+
+@pytest.mark.asyncio
+async def test_fast_worker_and_composers_accept_fenced_json(monkeypatch):
+    response = httpx.Response(200, request=httpx.Request("POST", CHAT_URL), json={"choices": [{"message": {
+        "content": '```json\n{"content":"Python 3.14","publish":true,"item_id":"one"}\n```'}}]})
+    client = AsyncMock()
+    client.post.return_value = response
+    client.__aenter__.return_value = client
+    monkeypatch.setattr("chatbot.core.ai_engine.httpx.AsyncClient", lambda **kwargs: client)
+    engine = AIDecisionEngine("key")
+    assert await engine.compose_reply({}) == "Python 3.14"
+    assert await engine.compose_task_worker({"goal": "Check version"}) == "Python 3.14"
+    assert (await engine.compose_proactive({}))["publish"] is True

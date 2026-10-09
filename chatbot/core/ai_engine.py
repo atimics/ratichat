@@ -817,7 +817,7 @@ Choose at most three actions in a step. Use wait when the request needs no reply
                         {"role": "user", "content": json.dumps(payload)}],
                         "response_format": {"type": "json_object"}, "temperature": 0.2, "max_tokens": 500})
                 response.raise_for_status()
-                value = json.loads(response.json()["choices"][0]["message"]["content"])
+                value = self._extract_json_from_response(response.json()["choices"][0]["message"]["content"])
                 return value if isinstance(value, dict) else None
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             return None
@@ -851,7 +851,7 @@ Choose at most three actions in a step. Use wait when the request needs no reply
                 )
                 response.raise_for_status()
                 text = response.json()["choices"][0]["message"]["content"]
-                content = json.loads(text).get("content")
+                content = self._extract_json_from_response(text).get("content")
                 return content.strip() if isinstance(content, str) and content.strip() else None
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
             logger.warning("Final node answer needs another attempt")
@@ -868,7 +868,7 @@ Choose at most three actions in a step. Use wait when the request needs no reply
                         {"role": "user", "content": json.dumps(payload)}],
                         "response_format": {"type": "json_object"}, "max_tokens": 900})
                 response.raise_for_status()
-                value = json.loads(response.json()["choices"][0]["message"]["content"]).get("content")
+                value = self._extract_json_from_response(response.json()["choices"][0]["message"]["content"]).get("content")
                 return value[:2500] if isinstance(value, str) and value.strip() else None
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
             return None

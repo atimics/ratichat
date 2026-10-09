@@ -4,6 +4,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -51,7 +52,14 @@ class TaskService:
         nodes = self.store.catalog(channel.type, channel.id, source.sender, query=source.content)
         inputs = self.store.snapshot_versions(channel.type, channel.id, source.sender,
             {k: v for k, v in nodes.items() if v["kind"] != "task"}, event_id=None if proactive else source.id)
-        task = self.store.task_for_request(channel.type, channel.id, source.sender, source.id,
+        task = self.store.get_task_for_event(channel.type, channel.id, source.id)
+        references = set(re.findall(r"task:[a-f0-9]{32}\b", source.content))
+        if not task and len(references) == 1:
+            identity = next(iter(references))
+            candidate = self.store.get_task(identity, channel.type, channel.id, source.sender)
+            if candidate:
+                task = self.store.continue_task(identity, channel.type, channel.id, source.sender, source.id)
+        task = task or self.store.task_for_request(channel.type, channel.id, source.sender, source.id,
             goal=source.content[:2000], budget_usd=self.budget_usd)
         route = task.get("route")
         if not route:
@@ -73,7 +81,7 @@ class TaskService:
             request_key="route:" + hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest() + f":{time.time_ns()}")
         route = await self.router.select_route(state,
             nodes=[{"id": k, "summary": v["summary"][:180]} for k, v in list(nodes.items())[:12]],
-            tasks=[{"id": task["id"], "summary": task.get("goal", "")[:240]},
+            tasks=[{"id": task["id"], "summary": task.get("goal", "")[:240], "is_placeholder": True},
                    *[{"id": t["id"], "summary": t.get("goal", "")[:240]} for t in tasks if t["id"] != task["id"]][:7]],
             personas=[p for p in PERSONAS if p["id"] == state.get("persona")] or PERSONAS,
             topics=TOPICS, current_task_id=task["id"],

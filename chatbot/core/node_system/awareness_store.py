@@ -179,8 +179,18 @@ class AwarenessStore:
 
     @staticmethod
     def _node(row):
-        return {"kind": row["kind"], "data": json.loads(row["data_json"]), "summary": row["summary"],
-                "version": row["version"], "summary_version": row["summary_version"], "valid": bool(row["valid"]),
+        data = json.loads(row["data_json"])
+        summary = row["summary"]
+        if not summary:
+            if row["kind"] == "conversation" and isinstance(data, dict):
+                summary = "; ".join(str(item.get("content", ""))[:180] for item in data.get("messages", [])[-3:])
+            elif row["kind"] == "task" and isinstance(data, dict):
+                summary = str(data.get("goal", ""))[:300] + " " + json.dumps(data.get("result"), ensure_ascii=False)[:350]
+            else:
+                summary = json.dumps(data, ensure_ascii=False)[:700]
+            summary = " ".join(summary.split())[:700]
+        return {"kind": row["kind"], "data": data, "summary": summary,
+                "version": row["version"], "summary_version": row["summary_version"] or row["version"], "valid": bool(row["valid"]),
                 "audience": {"kind": row["audience_kind"], "key": row["audience_key"]},
                 "evidence": json.loads(row["evidence_json"]), "updated_at": row["updated_at"]}
 
