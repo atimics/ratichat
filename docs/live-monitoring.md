@@ -15,6 +15,7 @@ Monitoring uses the feed watch outbox, stable delivery keys and platform receipt
 Configuration:
 
 - `LIVE_MONITOR_DAILY_LOOKUP_BUDGET`: scheduled checks per channel per UTC day; default 7200. Feed watches keep their own budget.
+- `ONCHAIN_REQUEST_GAP_SECONDS`: minimum gap between requests to the same explorer host; default one second. HTTP 403 and 429 responses pause that host with backoff. The reader honors numeric `Retry-After` values up to fifteen minutes.
 - `TRONGRID_API_KEY`: optional provider key for production quota and access.
 - `BLOCKSCOUT_API_KEY`: optional PRO API key. With a key, the reader uses the official multichain API and a bearer header. Public per-instance access depends on the explorer's current policy.
 

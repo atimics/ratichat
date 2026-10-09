@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -11,7 +12,7 @@ from chatbot.core.node_system.live_monitors import LiveMonitorService, MonitorSt
 from chatbot.core.node_system.source_watches import WatchStore
 from chatbot.core.orchestration.capability_policy import CapabilityPolicy, ExecutionScope
 from chatbot.tools.live_monitor_tools import CreateLiveMonitorTool
-from chatbot.tools.onchain_tools import OnchainReader, normalize_targets
+from chatbot.tools.onchain_tools import ExplorerHTTPError, OnchainReader, normalize_targets
 
 
 BTC = "bc1q" + "a" * 38
@@ -116,6 +117,33 @@ async def test_pagination_stops_at_saved_checkpoint_and_reports_bounded_gap():
     identity = result["streams"][0]["id"]
     result = await reader.check(TARGETS, {identity: {"keys": ["bitcoin:" + f"{2:064x}"]}})
     assert len(calls) == 2 and result["streams"][0]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_parallel_address_reads_share_host_pacing():
+    starts = []
+    async def fetch(url, headers):
+        starts.append(time.monotonic())
+        return {"items": [], "next_page_params": None}
+    reader = OnchainReader(fetch, min_request_gap=0.02)
+    result = await reader.check([{"address": EVM, "network": "ethereum"}, {"address": "0x" + "b" * 40, "network": "ethereum"}])
+    assert all(s["status"] == "ok" for s in result["streams"])
+    assert len(starts) == 4 and all(b - a >= 0.018 for a, b in zip(starts, starts[1:]))
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_pauses_host_and_keeps_other_networks_available():
+    calls = []
+    async def fetch(url, headers):
+        calls.append(url)
+        if "eth.blockscout" in url:
+            raise ExplorerHTTPError(429, retry_after=120)
+        return {"items": [], "next_page_params": None}
+    reader = OnchainReader(fetch)
+    result = await reader.check([{"address": EVM, "network": "ethereum"}, {"address": EVM, "network": "base"}])
+    assert len([u for u in calls if "eth.blockscout" in u]) == 1
+    assert all(s["status"] == "ok" for s in result["streams"] if s["network"] == "base")
+    assert reader._host_backoff["eth.blockscout.com"]["until"] - time.monotonic() > 119
 
 
 @pytest.mark.asyncio

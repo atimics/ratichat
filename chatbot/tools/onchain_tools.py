@@ -7,6 +7,7 @@ import re
 import time
 from datetime import datetime
 from urllib.parse import urlencode
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -73,10 +74,45 @@ def _event(network, txid, url, timestamp, **fields):
             "url": url, "timestamp": timestamp, **fields}
 
 
+class ExplorerHTTPError(ValueError):
+    def __init__(self, status, retry_after=0):
+        super().__init__(f"Explorer HTTP {status}. Check provider access and quota.")
+        self.status = status
+        try:
+            self.retry_after = min(900, max(0, float(retry_after or 0)))
+        except (ValueError, TypeError):
+            self.retry_after = 0
+
+
 class OnchainReader:
-    def __init__(self, fetch=None):
+    def __init__(self, fetch=None, min_request_gap=None):
         self.fetch = fetch or self._fetch
         self._semaphore = asyncio.Semaphore(3)
+        self.min_request_gap = (0 if fetch else settings.ONCHAIN_REQUEST_GAP_SECONDS) if min_request_gap is None else min_request_gap
+        self._host_locks, self._host_next, self._host_backoff = {}, {}, {}
+
+    async def _read(self, url, headers):
+        host = urlsplit(url).hostname
+        lock = self._host_locks.setdefault(host, asyncio.Lock())
+        async with lock:
+            now = time.monotonic()
+            backoff = self._host_backoff.get(host, {})
+            if backoff.get("until", 0) > now:
+                raise ValueError(f"Explorer HTTP {backoff['status']}; retry after {int(backoff['until'] - now) + 1} seconds.")
+            await asyncio.sleep(max(0, self._host_next.get(host, 0) - now))
+            self._host_next[host] = time.monotonic() + max(0, self.min_request_gap)
+            try:
+                data = await self.fetch(url, headers)
+                if isinstance(data, dict) and data.get("success") is False and data.get("statusCode") in {403, 429}:
+                    raise ExplorerHTTPError(data["statusCode"])
+            except ExplorerHTTPError as error:
+                if error.status in {403, 429}:
+                    failures = min(5, backoff.get("failures", 0) + 1)
+                    delay = min(900, max(error.retry_after, 60 * 2 ** (failures - 1)))
+                    self._host_backoff[host] = {"status": error.status, "failures": failures, "until": time.monotonic() + delay}
+                raise
+            self._host_backoff.pop(host, None)
+            return data
 
     async def _fetch(self, url, headers=None):
         connector = aiohttp.TCPConnector(resolver=PublicResolver(), use_dns_cache=False)
@@ -84,7 +120,7 @@ class OnchainReader:
             cookie_jar=aiohttp.DummyCookieJar(), timeout=aiohttp.ClientTimeout(total=15)) as client:
             async with client.get(url, headers=headers or {}, allow_redirects=False) as response:
                 if response.status != 200:
-                    raise ValueError(f"Explorer HTTP {response.status}. Check provider access and quota.")
+                    raise ExplorerHTTPError(response.status, response.headers.get("Retry-After"))
                 body = bytearray()
                 async for chunk in response.content.iter_chunked(8192):
                     body.extend(chunk)
@@ -127,7 +163,7 @@ class OnchainReader:
             async with self._semaphore:
                 for page in range(3):
                     url, headers = self._request(network, address, kind, cursor)
-                    data = await self.fetch(url, headers)
+                    data = await self._read(url, headers)
                     rows, cursor = self._rows(network, kind, data)
                     if any(not isinstance(row, dict) for row in rows):
                         raise ValueError("The explorer returned invalid transaction records.")
