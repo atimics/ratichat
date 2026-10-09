@@ -615,7 +615,9 @@ class AwarenessStore:
                 return {"saved": True, "conflict": False, "id": previous["id"], "route": json.loads(previous["data_json"])}
             identity = "route:" + uuid.uuid4().hex
             db.execute("INSERT INTO awareness_routes VALUES(?,?,?,?,?,?)", (identity, task_id, request_key, _json(route), _json(inputs), self.clock()))
-            db.execute("UPDATE awareness_tasks SET route_id=?,input_json=?,status='ready',updated_at=? WHERE id=?", (identity, _json(inputs), self.clock(), task_id))
+            db.execute("UPDATE awareness_tasks SET route_id=?,input_json=?,topic=?,persona_id=?,status='ready',updated_at=? WHERE id=?",
+                (identity, _json(inputs), str(route.get("topic", task["topic"]))[:100],
+                 str(route.get("persona", task["persona_id"]))[:100], self.clock(), task_id))
             self._task_node(db, task_id)
             return {"saved": True, "conflict": False, "id": identity, "route": route}
 

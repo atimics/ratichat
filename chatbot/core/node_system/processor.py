@@ -220,11 +220,8 @@ class NodeProcessor:
             return
         task = self.awareness_store.get_task_for_event(turn["platform"], turn["channel_id"], turn["event_id"])
         if task:
-            attempt = self.awareness_store.reserve_attempt(task["id"], 0.000001,
-                request_key="confirmed-reply:" + turn["event_id"], input_versions={})
-            if attempt.get("reserved"):
-                self.awareness_store.record_result(task["id"], {"kind": "reply", "content": turn["reply"], "receipt": receipt},
-                    attempt_id=attempt["id"], input_versions={})
+            self.awareness_store.record_result(task["id"], {"kind": "reply", "content": turn["reply"], "receipt": receipt},
+                input_versions=task["input_versions"])
         message_id = receipt.get("message_id") or receipt.get("event_id")
         if message_id:
             self.awareness_store.ingest_message(turn["platform"], turn["channel_id"], {
@@ -275,12 +272,18 @@ class NodeProcessor:
                 return await self._run_cycle_inner(cycle_id, primary_channel_id, context, channel, turn)
         except (ValueError, PermissionError) as error:
             logger.warning("Saved task needs attention: %s", error)
-            if turn:
-                self.research_store.fail(turn["id"], turn["lease_token"], "Task needs a fresh budget or source version", retryable=False)
+            if turn and self.awareness_store.request_current(channel.type, channel.id, source.id, source.content):
+                scope = self.policy.scope_from_payload(self.payload_builder.build_request_node_payload(channel, self.node_manager))
+                action = ActionPlan("send_discord_reply" if channel.type == "discord" else "send_matrix_reply",
+                    {"channel_id": channel.id, "reply_to_id": source.id,
+                     "content": "This saved task needs a fresh start. Please ask me to start a new task for this topic."}, "Report saved task status", 1)
+                await self._save_and_send(action, scope, turn, {})
+            elif turn:
+                self.research_store.fail(turn["id"], turn["lease_token"], "Use a current source version", retryable=False)
             return self._result(0, 0, 0, failed=True)
         finally:
             if self._binding and self._view is not None:
-                paths = set(self._binding.nodes)
+                paths = set(self._binding.nodes) & set(self.awareness_store.catalog(channel.type, channel.id, source.sender))
                 self.awareness_store.save_view(self._view_id(channel, source), channel.type, channel.id, source.sender,
                     expanded=[k for k in self.node_manager.get_expanded_nodes() if k in paths],
                     collapsed=[k for k in paths if not self.node_manager.get_node_metadata(k).is_expanded],
@@ -425,6 +428,8 @@ class NodeProcessor:
                     }
                     self.last_payload = copy.deepcopy(payload)
                     content = await self.ai_engine.compose_reply(payload)
+                    if not content and self._binding and self._binding.issue:
+                        content = "This saved task needs a fresh start. Please ask me to start a new task for this topic."
                     failed = not content
                     if failed and turn and turn["attempts"] < self.research_store.max_attempts:
                         self.research_store.fail(turn["id"], turn["lease_token"], "AI reply needs another attempt", retry_after=10 * turn["attempts"])
@@ -487,15 +492,27 @@ class NodeProcessor:
                             action.parameters = parameters
                             lookup_attempt = None
                             if self._binding and action.action_type in {"web_search", "search_social"}:
-                                lookup_attempt = self.awareness_store.reserve_attempt(self._binding.task["id"], 0.01,
+                                lookup_attempt = self.awareness_store.reserve_attempt(self._binding.task["id"], 0.02,
                                     request_key=f"lookup:{source.id}:{time.time_ns()}:{signature}")
                             result = await self.executor._execute_action_and_return_result(action, scope)
+                            if lookup_attempt:
+                                cost = result.get("usage", {}).get("cost")
+                                if cost is None:
+                                    cost = 0 if result.get("http_status") in {400, 401, 402, 403, 404, 413, 422, 429} else lookup_attempt["reserved_usd"]
+                                self.awareness_store.record_result(self._binding.task["id"],
+                                    {"kind": "source_read", "tool": action.action_type, "status": result.get("status"),
+                                     "cost_source": "provider" if result.get("usage", {}).get("cost") is not None else "reserved_bound"},
+                                    attempt_id=lookup_attempt["id"], cost_usd=cost, status="active")
                             if self._binding and result.get("status") == "success":
-                                if lookup_attempt:
-                                    self.awareness_store.record_result(self._binding.task["id"], {"kind": "source_read", "tool": action.action_type},
-                                        attempt_id=lookup_attempt["id"], cost_usd=lookup_attempt["reserved_usd"], status="active")
-                                self.awareness_store.source_result(channel.type, channel.id, source.sender,
+                                shared_source = self.awareness_store.source_result(channel.type, channel.id, source.sender,
                                     action.action_type, parameters, result)
+                                node_id = shared_source["node_id"]
+                                self._binding.nodes[node_id] = {k: v for k, v in shared_source.items() if k != "node_id"}
+                                self._binding.fresh_nodes.add(node_id)
+                                self._binding.input_versions = self.awareness_store.snapshot_versions(
+                                    channel.type, channel.id, source.sender, {k: v for k, v in self._binding.nodes.items() if v["kind"] != "task"})
+                                self.awareness_store.save_route(self._binding.task["id"], self._binding.route,
+                                    input_versions=self._binding.input_versions)
                             if turn and result.get("status") == "success":
                                 self.research_store.save_source(channel.type, channel.id, action.action_type, parameters, result, ttl_seconds=settings.RESEARCH_SOURCE_TTL_SECONDS)
                         path = f"sources.result_{lookups}"

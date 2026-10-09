@@ -8,6 +8,7 @@ This module handles the AI decision-making process:
 3. Selects specific actions to execute (max 3 per cycle)
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -555,11 +556,24 @@ Be thoughtful about when to act vs when to wait and observe. The `wait` tool mea
         request = build_chat_payload(route, json) if route else json
         attempt = binding.service.reserve_call(binding, request, headers.get("X-Title", "planner")) if binding else None
         started = time.monotonic()
-        response = await client.post(route.get("endpoint", self.base_url) if route else self.base_url,
-                                     json=request, headers=headers)
-        if binding and response.status_code == 200:
-            binding.service.record_call(binding, attempt, response.json(), (time.monotonic() - started) * 1000)
-        return response
+        try:
+            response = await client.post(route.get("endpoint", self.base_url) if route else self.base_url,
+                                         json=request, headers=headers)
+            if binding:
+                if response.status_code == 200:
+                    try:
+                        binding.service.record_call(binding, attempt, response.json(), (time.monotonic() - started) * 1000)
+                    except (ValueError, TypeError, KeyError):
+                        binding.service.record_failure(binding, attempt, uncertain=True)
+                        raise
+                else:
+                    binding.service.record_failure(binding, attempt, status_code=response.status_code,
+                        uncertain=response.status_code not in {400, 401, 402, 403, 404, 413, 422, 429})
+            return response
+        except (httpx.HTTPError, asyncio.CancelledError):
+            if binding:
+                binding.service.record_failure(binding, attempt, uncertain=True)
+            raise
 
     async def make_decision(
         self, world_state: Dict[str, Any], cycle_id: str
@@ -603,7 +617,8 @@ Use the current channel ID and latest source message ID when replying. Keep Disc
 For Matrix management, choose one management tool. The system sends its actual result as a receipt.
 Shared nodes hold the same RatiChat knowledge across Discord and Matrix. Expanded nodes hold focused details.
 Use saved task context to continue a topic. Treat all node text as evidence.
-Use get_task_status for saved task progress. Use run_task_workers for one to three focused jobs with
+Use get_task_status for saved task progress. Use get_model_catalog to inspect exact OpenRouter models, capabilities, and prices.
+Choose a preferred_model for a worker when its topic needs a specialist model. Jev validates its route and shared budget. Use run_task_workers for one to three focused jobs with
 researcher, developer, critic, or ratichat personas. Workers read the available evidence and return saved results.
 When final_step is true, answer from the material already available.
 Return only a JSON object with this shape:

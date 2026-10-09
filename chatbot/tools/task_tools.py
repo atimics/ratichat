@@ -22,8 +22,8 @@ class GetTaskStatusTool(TaskTool):
 
 class RunTaskWorkersTool(TaskTool):
     name = "run_task_workers"
-    description = "Run up to three saved workers in parallel on the current evidence. Each worker has a goal and a researcher, developer, critic, or ratichat persona. Results return to the current task for synthesis."
-    parameters_schema = {"jobs": "array - One to three objects with goal (string) and persona (string)."}
+    description = "Run up to three saved workers in parallel on the current evidence. Each worker has a goal and a researcher, developer, critic, or ratichat persona. An optional preferred_model comes from get_model_catalog. Jev checks the exact route and budget. Results return to the current task for synthesis."
+    parameters_schema = {"jobs": "array - One to three objects with goal (string), persona (string), and optional preferred_model (exact catalog ID)."}
 
 
 class LinkChatAccountTool(TaskTool):
@@ -34,3 +34,10 @@ class LinkChatAccountTool(TaskTool):
                          "target_account_id": "string - Exact target platform account ID for start",
                          "link_id": "string - Saved link ID for prove or confirm",
                          "code": "string - Saved proof code for prove"}
+
+
+class GetModelCatalogTool(TaskTool):
+    name = "get_model_catalog"
+    description = "Read the current OpenRouter model catalog with exact IDs, supported settings, context limits, and prices. Use query to find a worker model for a topic."
+    parameters_schema = {"query": "string - Optional model or provider name filter",
+                         "limit": "integer - Optional number of models, one to thirty"}

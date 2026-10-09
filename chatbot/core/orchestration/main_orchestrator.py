@@ -572,11 +572,12 @@ class MainOrchestrator:
         self.tool_registry.register_tool(WebSearchTool())
         self.tool_registry.register_tool(ReadWebpageTool())
         self.tool_registry.register_tool(ReadFeedTool())
-        from ...tools.task_tools import GetTaskStatusTool, RunTaskWorkersTool, LinkChatAccountTool
+        from ...tools.task_tools import GetTaskStatusTool, RunTaskWorkersTool, LinkChatAccountTool, GetModelCatalogTool
         if self.task_service:
             self.tool_registry.register_tool(GetTaskStatusTool())
             self.tool_registry.register_tool(RunTaskWorkersTool())
             self.tool_registry.register_tool(LinkChatAccountTool())
+            self.tool_registry.register_tool(GetModelCatalogTool())
         from ...tools.public_source_tools import ListPublicSourcesTool, ReadNewsTool, SearchSocialTool, ReadBlueskyFeedTool
         from ...tools.proactive_source_tools import ConfigureProactiveTool, GetProactiveStatusTool
         for tool in (ListPublicSourcesTool(), ReadNewsTool(), SearchSocialTool(), ReadBlueskyFeedTool(), ConfigureProactiveTool(), GetProactiveStatusTool()):

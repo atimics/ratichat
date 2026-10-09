@@ -35,6 +35,8 @@ class TaskBinding:
     route: dict
     sequence: int = 0
     input_versions: dict = field(default_factory=dict)
+    fresh_nodes: set = field(default_factory=set)
+    issue: str = ""
 
 
 class TaskService:
@@ -51,23 +53,26 @@ class TaskService:
         route = task.get("route")
         if not route:
             tasks = [] if proactive else self.store.list_tasks(channel.type, channel.id, source.sender)
-            route = await self._route(task, {"request": source.content[:3000], "platform": channel.type,
+            route = await self._route(task, {"request": source.content[:1500], "platform": channel.type,
                 "channel_id": channel.id, "proactive": proactive}, nodes, tasks)
             resume = route.get("resume_task_id")
             if resume and resume != task["id"]:
-                task = self.store.continue_task(resume, channel.type, channel.id, source.sender, source.id)
+                task = self.store.continue_task(resume, channel.type, channel.id, source.sender, source.id, replace_task_id=task["id"])
                 route = task.get("route") or route
-            self.store.save_route(task["id"], route, input_versions={k: v["version"] for k, v in nodes.items() if v.get("kind") != "task"})
+            self.store.save_route(task["id"], route, input_versions=self.store.snapshot_versions(channel.type, channel.id, source.sender, {k: v for k, v in nodes.items() if v["kind"] != "task"}))
         return TaskBinding(self, task, channel.type, channel.id, source.sender, source.id,
-            copy.deepcopy(nodes), route, input_versions={k: v["version"] for k, v in nodes.items() if v.get("kind") != "task"})
+            copy.deepcopy(nodes), route, input_versions=self.store.snapshot_versions(channel.type, channel.id, source.sender, {k: v for k, v in nodes.items() if v["kind"] != "task"}))
 
-    async def _route(self, task, state, nodes, tasks=()):
+    async def _route(self, task, state, nodes, tasks=(), preferred_models=None):
         attempt = self.store.reserve_attempt(task["id"], 0.001,
             request_key="route:" + hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest() + f":{time.time_ns()}")
         route = await self.router.select_route(state,
-            nodes=[{"id": k, "summary": v["summary"]} for k, v in nodes.items()],
-            tasks=[{"id": t["id"], "summary": t.get("goal", "")[:1000]} for t in tasks if t["id"] != task["id"]],
-            personas=PERSONAS, topics=TOPICS, current_task_id=task["id"],
+            nodes=[{"id": k, "summary": v["summary"][:180]} for k, v in list(nodes.items())[:12]],
+            tasks=[{"id": task["id"], "summary": task.get("goal", "")[:240]},
+                   *[{"id": t["id"], "summary": t.get("goal", "")[:240]} for t in tasks if t["id"] != task["id"]][:7]],
+            personas=[p for p in PERSONAS if p["id"] == state.get("persona")] or PERSONAS,
+            topics=TOPICS, current_task_id=task["id"],
+            preferred_models=preferred_models, allowed_models=preferred_models,
             max_tokens=1400, budget_usd=max(0, task["budget_usd"] - task.get("spent_usd", 0) - task.get("reserved_usd", 0)))
         receipt = route.get("decision_receipt", {})
         cost = receipt.get("usage", {}).get("cost") if isinstance(receipt, dict) else None
@@ -93,10 +98,15 @@ class TaskService:
         size = len(json.dumps(request).encode())
         estimate = size * float(pricing.get("prompt", 0)) + int(request.get("max_tokens", request.get("max_completion_tokens", 1400))) * float(pricing.get("completion", 0))
         estimate = max(0.0001, estimate)
-        attempt = self.store.reserve_attempt(binding.task["id"], estimate,
-            request_key=f"{binding.event_id}:{label}:{time.time_ns()}:{binding.sequence}",
-            input_versions=binding.input_versions)
+        try:
+            attempt = self.store.reserve_attempt(binding.task["id"], estimate,
+                request_key=f"{binding.event_id}:{label}:{time.time_ns()}:{binding.sequence}",
+                input_versions=binding.input_versions)
+        except ValueError:
+            binding.issue = "budget"
+            raise
         if not attempt.get("reserved"):
+            binding.issue = "source"
             raise ValueError("Use a fresh source snapshot for this task.")
         return attempt
 
@@ -108,12 +118,27 @@ class TaskService:
         if not saved.get("accepted"):
             raise ValueError("Use a fresh source snapshot and the remaining task budget.")
 
+    def record_failure(self, binding, attempt, *, status_code=None, uncertain=False):
+        self.store.record_result(binding.task["id"], {"kind": "inference_failure", "status_code": status_code,
+            "outcome": "unknown" if uncertain else "rejected", "cost_source": "reserved_bound" if uncertain else "pre_inference_rejection"},
+            attempt_id=attempt["id"], cost_usd=attempt["reserved_usd"] if uncertain else 0,
+            input_versions=attempt["input_versions"], success=False, status="active")
+
     async def execute_tool(self, name, params, scope):
         binding = ACTIVE_TASK.get()
         if not binding or (binding.platform, binding.channel_id, binding.sender_id, binding.event_id) != (
                 scope.channel_type, scope.channel_id, scope.latest_sender_id, scope.latest_event_id):
             return {"status": "blocked", "message": "Use an active saved task for this request."}
         try:
+            if name == "get_model_catalog":
+                await self.router.refresh()
+                query = str(params.get("query", "")).lower()[:100]
+                limit = params.get("limit", 20)
+                if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 30:
+                    raise ValueError("Choose a catalog limit from one to thirty.")
+                models = [m for m in self.router.catalog_nodes() if query in m["model_id"].lower()]
+                return {"status": "success", "catalog_version": self.router.catalog_version,
+                        "matching_models": len(models), "models": models[:limit]}
             if name == "get_task_status":
                 return {"status": "success", "task": self.store.get_task(binding.task["id"]),
                         "tasks": self.store.list_tasks(binding.platform, binding.channel_id, binding.sender_id)}
@@ -133,8 +158,12 @@ class TaskService:
                 if not isinstance(jobs, list) or not 1 <= len(jobs) <= 3:
                     raise ValueError("Choose one to three worker jobs.")
                 for job in jobs:
-                    if not isinstance(job, dict) or set(job) - {"goal", "persona"}:
+                    if not isinstance(job, dict) or set(job) - {"goal", "persona", "preferred_model"}:
                         raise ValueError("Use a goal and a listed persona for each worker.")
+                    if job.get("preferred_model"):
+                        await self.router.refresh()
+                        if job["preferred_model"] not in {m["model_id"] for m in self.router.catalog_nodes()}:
+                            raise ValueError("Choose an exact model from the current catalog.")
                     if job.get("persona", "researcher") not in {p["id"] for p in PERSONAS} or not isinstance(job.get("goal"), str) or not job["goal"].strip():
                         raise ValueError("Give each worker a goal and a listed persona.")
                 results = await asyncio.gather(*(self._worker(binding, job, index) for index, job in enumerate(jobs)))
@@ -144,13 +173,14 @@ class TaskService:
         return {"status": "blocked", "message": "Choose a listed task tool."}
 
     async def _worker(self, parent, job, index):
-        child = self.store.create_child(parent.task["id"], request_key=f"{parent.event_id}:{index}:{job['goal'][:2000]}",
+        child = self.store.create_child(parent.task["id"], request_key=f"{parent.event_id}:{index}:{hashlib.sha256(json.dumps(job, sort_keys=True).encode()).hexdigest()}",
             goal=job["goal"][:2000], persona_id=job.get("persona", "researcher"))
         if child.get("status") == "complete" and child.get("result"):
             return {"task_id": child["id"], "result": child["result"], "saved": True}
         try:
             route = child.get("route") or await self._route(child,
-                {"request": job["goal"][:2000], "persona": job.get("persona", "researcher")}, parent.nodes)
+                {"request": job["goal"][:1500], "persona": job.get("persona", "researcher")}, parent.nodes,
+                preferred_models=[job["preferred_model"]] if job.get("preferred_model") else None)
             route["persona"] = job.get("persona", "researcher")
             self.store.save_route(child["id"], route, input_versions=parent.input_versions)
             binding = TaskBinding(self, child, parent.platform, parent.channel_id, parent.sender_id,
@@ -158,14 +188,12 @@ class TaskService:
             with self.activate(binding):
                 result = await asyncio.wait_for(self.ai_engine.compose_task_worker({
                     "goal": job["goal"][:2000], "persona": route["persona"],
-                    "nodes": parent.nodes, "task_route": route}), 60)
+                    "nodes": {k: v if k in route.get("expanded_nodes", []) or k in parent.fresh_nodes
+                        else {"summary": v["summary"], "version": v["version"], "kind": v["kind"]}
+                        for k, v in parent.nodes.items()}, "task_route": route}), 60)
             if result:
-                attempt = self.store.reserve_attempt(child["id"], 0.000001,
-                    request_key="worker-result:" + child["id"], input_versions=parent.input_versions)
-                if not attempt.get("reserved"):
-                    raise ValueError("Use a fresh worker source snapshot.")
                 saved = self.store.record_result(child["id"], {"kind": "worker", "content": result},
-                    attempt_id=attempt["id"], input_versions=parent.input_versions)
+                    input_versions=parent.input_versions)
                 return {"task_id": child["id"], "content": result if saved.get("accepted") else "", "saved": saved}
             return {"task_id": child["id"], "status": "retry"}
         except (ValueError, PermissionError, asyncio.TimeoutError):

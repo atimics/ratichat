@@ -374,7 +374,7 @@ class ProactiveSourceService:
         with service.activate(binding) if binding else nullcontext():
             attempt = None
             if binding and claim["topic"] in {"ai", "reddit", "social"}:
-                attempt = service.store.reserve_attempt(binding.task["id"], 0.01,
+                attempt = service.store.reserve_attempt(binding.task["id"], 0.02,
                     request_key="proactive-source:" + binding.event_id, input_versions=binding.input_versions)
                 if not attempt.get("reserved"):
                     raise ValueError("Use a fresh proactive source snapshot")

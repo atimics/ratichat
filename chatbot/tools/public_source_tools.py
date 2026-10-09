@@ -96,10 +96,11 @@ class SearchSocialTool(ToolInterface):
                     continue
             if not sources:
                 return {"status": "failure", "error": "Try a more specific topic to find indexed public posts.",
-                        "platform": platform, "access": "public_search_index"}
+                        "platform": platform, "access": "public_search_index", "usage": result.get("usage", {})}
             return {"status": "success", "platform": platform, "query": query.strip(),
                     "access": "public_search_index", "sources": sources[:3],
-                    "timestamp": result.get("timestamp", time.time()), "trust": "untrusted_source"}
+                    "timestamp": result.get("timestamp", time.time()), "trust": "untrusted_source",
+                    "usage": result.get("usage", {}), "model": result.get("model")}
         except ValueError as error:
             return {"status": "failure", "error": str(error)}
 

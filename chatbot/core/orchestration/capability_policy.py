@@ -11,7 +11,7 @@ SOURCE_WATCH_TOOLS = WATCH_READ_TOOLS | WATCH_WRITE_TOOLS
 PROACTIVE_READ_TOOLS = frozenset({"get_proactive_status"})
 PROACTIVE_WRITE_TOOLS = frozenset({"configure_proactive"})
 PROACTIVE_SOURCE_TOOLS = PROACTIVE_READ_TOOLS | PROACTIVE_WRITE_TOOLS
-TASK_TOOLS = frozenset({"get_task_status", "run_task_workers", "link_chat_account"})
+TASK_TOOLS = frozenset({"get_task_status", "run_task_workers", "link_chat_account", "get_model_catalog"})
 STATE_TOOLS = SOURCE_WATCH_TOOLS | PROACTIVE_SOURCE_TOOLS | TASK_TOOLS
 
 PUBLIC_BOT_ALLOWED_TOOLS = READ_ONLY_SOURCE_TOOLS | STATE_TOOLS | frozenset(
