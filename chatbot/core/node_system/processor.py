@@ -260,11 +260,24 @@ class NodeProcessor:
         scope_payload = self.payload_builder.build_request_node_payload(channel, self.node_manager)
         channel_node = scope_payload["expanded_nodes"][channel_path]["data"]
         scope = self.policy.scope_from_payload(scope_payload)
+        if turn:
+            saved_watch_results = [data for data in turn["sources"] if data.get("tool") in SOURCE_WATCH_TOOLS]
+            if self.watch_service:
+                trusted_scope = {"channel_type": scope.channel_type, "channel_id": scope.channel_id,
+                                 "sender_id": scope.latest_sender_id, "event_id": scope.latest_event_id}
+                for data in self.watch_service.store.tool_results(trusted_scope):
+                    if data not in saved_watch_results:
+                        saved_watch_results.append(data)
+            for index, data in enumerate(saved_watch_results, 1):
+                path = "sources.watch_result_" + str(index)
+                sources[path] = data
+                self.node_manager.expand_node(path)
         allowed = self.policy.filter_tool_names(self.executor.tool_registry.get_tool_names(), scope)
         if turn:
             allowed &= READ_ONLY_SOURCE_TOOLS | SOURCE_WATCH_TOOLS | REPLY_TOOLS | MANAGEMENT_TOOLS | {"wait"}
         lookups, executed = 0, 0
-        results = []
+        results = [{"tool": data["tool"], "node_path": path, "result": data}
+                   for path, data in sources.items() if path.startswith("sources.watch_result_")]
         seen_lookups = set()
         force_answer = False
         try:
@@ -329,6 +342,10 @@ class NodeProcessor:
                         result = await self.executor._execute_action_and_return_result(action, scope)
                         path = "sources.watch_result_" + str(1 + sum(key.startswith("sources.watch_result_") for key in sources))
                         sources[path] = {"tool": action.action_type, "trust": "untrusted_source", **result}
+                        if turn:
+                            records = [data for key, data in sources.items() if key.startswith("sources.watch_result_")]
+                            if not self.research_store.save_sources(turn["id"], turn["lease_token"], records):
+                                return self._result(executed, lookups, step + 1, failed=True)
                         self.node_manager.expand_node(path)
                         results.append({"tool": action.action_type, "node_path": path, "result": result})
                         executed += 1
@@ -373,6 +390,9 @@ class NodeProcessor:
                 for action in actions:
                     if action.action_type not in names:
                         continue
+                    if action.action_type == "wait" and any(path.startswith("sources.watch_result_") for path in sources):
+                        force_answer = True
+                        break
                     if turn and action.action_type in REPLY_TOOLS:
                         result = await self._save_and_send(action, scope, turn, sources)
                     else:

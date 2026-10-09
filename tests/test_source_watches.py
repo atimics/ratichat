@@ -56,6 +56,24 @@ def test_store_requires_configured_owner_and_trusted_owner_flag(tmp_path, sender
     assert store.list(scope()) == []
 
 
+def test_saved_tool_results_keep_the_request_sender_channel_and_event(tmp_path):
+    clock = Clock()
+    store = make_store(tmp_path, clock)
+    created = store.execute_mutation("create_source_watch", {"url": FEED}, scope(), is_owner=True)
+    removed = store.execute_mutation("remove_source_watch", {"watch_id": created["watch"]["watch_id"]}, scope(), is_owner=True)
+    results = store.tool_results(scope())
+    assert results == [
+        {"tool": "create_source_watch", "trust": "untrusted_source", **created},
+        {"tool": "remove_source_watch", "trust": "untrusted_source", **removed},
+    ]
+    assert make_store(tmp_path, clock).tool_results(scope()) == results
+    assert store.tool_results(scope(sender="guest")) == []
+    assert store.tool_results(scope(event="other")) == []
+    assert store.tool_results(scope("21")) == []
+    with pytest.raises(ValueError, match="configured channel"):
+        store.tool_results(scope("private"))
+
+
 def test_store_defaults_require_owner_and_channel_configuration(tmp_path):
     store = WatchStore(tmp_path / "closed.db")
     with pytest.raises(ValueError, match="configured channel"):
