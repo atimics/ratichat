@@ -405,6 +405,7 @@ class MatrixObserver(Integration):
             image_urls=image_urls_list if image_urls_list else None,
             metadata=metadata,
         )
+        message.metadata["conversation_candidate"] = settings.CONVERSATION_PARTICIPATION_ENABLED
 
         if self.awareness_store:
             try:

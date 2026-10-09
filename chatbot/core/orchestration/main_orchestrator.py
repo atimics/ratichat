@@ -464,6 +464,11 @@ class MainOrchestrator:
         self.task_service = TaskService(self.awareness_store, self.model_router, self.ai_engine) if self.awareness_store and self.model_router else None
         self.action_context.task_service = self.task_service
         self.action_context.awareness_store = self.awareness_store
+        from ..model_router import JevDecisionClient
+        from ..node_system.participation import ParticipationService
+        self.participation_service = ParticipationService(self.config.db_path,
+            self.model_router.decisions if self.model_router else JevDecisionClient(lambda: self.ai_engine.api_key),
+            self.awareness_store) if settings.CONVERSATION_PARTICIPATION_ENABLED else None
         from ...integrations.matrix.steward import MatrixSteward
         self.matrix_steward = MatrixSteward(settings, self.config.db_path)
         self.action_context.matrix_steward = self.matrix_steward
@@ -789,6 +794,7 @@ class MainOrchestrator:
             self.world_state, self.payload_builder, traditional_processor, self.config.db_path,
             research_store=self.research_store, awareness_store=self.awareness_store,
             task_service=self.task_service,
+            participation_service=self.participation_service,
         )
         from ..node_system.source_watches import WatchStore, SourceWatchService
         from ..node_system.watch_delivery import WatchDelivery

@@ -88,9 +88,9 @@ async def test_discord_passive_message_keeps_reply_and_source_time(discord_obser
     assert saved["sender"] == "50"
     assert saved["metadata"]["bot_mentioned"] is False
     assert len(discord_observer.awareness_store.messages) == 1
-    assert not discord_observer.can_reply("20", "40")
-    assert discord_observer.world_state.get_channel("20") is None
-    discord_observer.on_state_change.assert_not_called()
+    assert discord_observer.can_reply("20", "40")
+    assert len(discord_observer.world_state.get_channel("20").recent_messages) == 1
+    discord_observer.on_state_change.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -116,11 +116,43 @@ async def test_discord_historical_message_is_saved_as_context(discord_observer):
 @pytest.mark.parametrize("changes", [
     {"guild": None}, {"guild": SimpleNamespace(id=99)},
     {"channel": SimpleNamespace(id=99, name="other")},
-    {"author": SimpleNamespace(id=50, bot=True)}, {"webhook_id": 2}, {"content": ""},
+    {"content": ""},
 ])
-async def test_discord_awareness_keeps_configured_human_scope(discord_observer, changes):
+async def test_discord_awareness_keeps_configured_channel_scope(discord_observer, changes):
     await discord_observer._handle_message(discord_message(**changes))
     assert not discord_observer.awareness_store.messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("webhook", [None, 2])
+async def test_discord_peer_bot_and_webhook_are_conversation_members(discord_observer, webhook):
+    source = discord_message(author=SimpleNamespace(id=60, bot=True, name="peer", display_name="Peer"), webhook_id=webhook)
+    await discord_observer._handle_message(source)
+    saved = discord_observer.awareness_store.messages["discord", "20", "40"]
+    assert saved["metadata"]["is_bot"] and saved["metadata"]["conversation_candidate"]
+    assert saved["sender"] == "60" and not saved["metadata"]["bot_mentioned"]
+    assert discord_observer.can_reply("20", "40")
+
+
+@pytest.mark.asyncio
+async def test_discord_embed_only_bot_post_keeps_evidence_and_edits(discord_observer):
+    source = discord_message(content="", author=SimpleNamespace(id=60, bot=True, name="news", display_name="News"),
+        embeds=[{"title": "Python release", "description": "Python 3.14", "url": "https://python.org"}])
+    await discord_observer._handle_message(source)
+    saved = discord_observer.awareness_store.messages["discord", "20", "40"]
+    assert "Python 3.14" in saved["content"] and "https://python.org" in saved["content"]
+    await discord_observer._handle_message_edit(discord_edit(cached_message=source, data={
+        "embeds": [{"description": "Python 3.15"}],
+        "edited_timestamp": datetime.fromtimestamp(time.time() + 1, timezone.utc).isoformat()}))
+    assert "Python 3.15" in saved["content"] and "Python 3.14" not in saved["content"]
+
+
+@pytest.mark.asyncio
+async def test_discord_own_gateway_message_keeps_saved_reply_path(discord_observer):
+    await discord_observer._handle_message(discord_message(
+        author=SimpleNamespace(id=30, bot=True), mentions=[SimpleNamespace(id=30)]))
+    assert not discord_observer.awareness_store.messages
+    assert not discord_observer._requests
 
 
 @pytest.mark.asyncio

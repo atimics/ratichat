@@ -22,6 +22,7 @@ def observer():
     config = AppConfig(
         _env_file=None, DISCORD_BOT_TOKEN="test-secret",
         DISCORD_ALLOWED_GUILD_IDS="10", DISCORD_ALLOWED_CHANNEL_IDS="20",
+        CONVERSATION_PARTICIPATION_ENABLED=False,
     )
     connection = DiscordObserver(WorldStateManager(), config)
     connection.client = SimpleNamespace(user=SimpleNamespace(id=30), is_ready=lambda: True)
