@@ -255,16 +255,23 @@ class NodeProcessor:
             sources["channel.memory"] = self.research_store.memory_node(channel.type, channel.id)
             self.node_manager.expand_node("channel.memory")
             self.node_manager.pin_node("channel.memory")
-            saved_watch_results = [data for data in turn["sources"] if data.get("tool") in SOURCE_WATCH_TOOLS]
-            for index, data in enumerate(saved_watch_results, 1):
-                path = "sources.watch_result_" + str(index)
-                sources[path] = data
-                self.node_manager.expand_node(path)
         if self.watch_service and channel.type in {"discord", "matrix"}:
             sources["sources.watches"] = self._watch_node(channel)
         scope_payload = self.payload_builder.build_request_node_payload(channel, self.node_manager)
         channel_node = scope_payload["expanded_nodes"][channel_path]["data"]
         scope = self.policy.scope_from_payload(scope_payload)
+        if turn:
+            saved_watch_results = [data for data in turn["sources"] if data.get("tool") in SOURCE_WATCH_TOOLS]
+            if self.watch_service:
+                trusted_scope = {"channel_type": scope.channel_type, "channel_id": scope.channel_id,
+                                 "sender_id": scope.latest_sender_id, "event_id": scope.latest_event_id}
+                for data in self.watch_service.store.tool_results(trusted_scope):
+                    if data not in saved_watch_results:
+                        saved_watch_results.append(data)
+            for index, data in enumerate(saved_watch_results, 1):
+                path = "sources.watch_result_" + str(index)
+                sources[path] = data
+                self.node_manager.expand_node(path)
         allowed = self.policy.filter_tool_names(self.executor.tool_registry.get_tool_names(), scope)
         if turn:
             allowed &= READ_ONLY_SOURCE_TOOLS | SOURCE_WATCH_TOOLS | REPLY_TOOLS | MANAGEMENT_TOOLS | {"wait"}

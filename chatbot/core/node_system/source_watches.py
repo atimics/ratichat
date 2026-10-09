@@ -257,6 +257,17 @@ class WatchStore:
         db.execute("INSERT INTO source_watch_tool_receipts VALUES (?,?,?,?,?,?,?,?)",
                    (*key, sender_id, json.dumps(result, ensure_ascii=False), self.now()))
 
+    def tool_results(self, scope):
+        """Read saved mutation results for this sender's original request."""
+        scope = self._check_scope(scope)
+        with self._db() as db:
+            rows = db.execute("""SELECT tool_name,result_json FROM source_watch_tool_receipts
+                WHERE channel_type=? AND channel_id=? AND event_id=? AND sender_id=?
+                ORDER BY created_at DESC,rowid DESC LIMIT 15""",
+                (scope["channel_type"], scope["channel_id"], scope["event_id"], scope["sender_id"])).fetchall()
+            return [{"tool": row["tool_name"], "trust": "untrusted_source", **json.loads(row["result_json"])}
+                    for row in reversed(rows)]
+
     def list(self, scope):
         scope = self._check_scope(scope)
         with self._db() as db:

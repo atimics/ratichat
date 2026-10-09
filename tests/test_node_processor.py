@@ -508,6 +508,30 @@ async def test_watch_result_survives_restart_when_retry_planner_waits(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_watch_receipt_survives_failed_request_checkpoint(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [
+        decision(plan("create_source_watch", url="https://example.com/feed")), decision(plan("wait")),
+    ])
+    store = wire_watch_tools(processor)
+    processor.research_store.clock = lambda: 1000
+    processor.research_store.save_sources = Mock(side_effect=RuntimeError("Checkpoint needs another attempt"))
+    assert (await processor.process_cycle("first", "20"))["failed"]
+    saved_watch = store.list({"channel_type": "discord", "channel_id": "20"})[0]
+    assert processor.research_store.get(1)["sources"] == []
+    ai.compose_reply.assert_not_awaited()
+    processor.research_store.close()
+    restarted = NodeProcessor(processor.world_state, processor.payload_builder, processor.executor, processor.db_path)
+    restarted.watch_service = processor.watch_service
+    restarted.research_store.clock = lambda: 1011
+    assert not (await restarted.process_cycle("retry", "20"))["failed"]
+    receipt = ai.compose_reply.await_args.args[0]["answer_nodes"]["sources.watch_result_1"]
+    assert receipt["watch"]["watch_id"] == saved_watch["id"] and receipt["status"] == "success"
+    assert len(store.list({"channel_type": "discord", "channel_id": "20"})) == 1
+    tools["send_discord_reply"].execute.assert_awaited_once()
+    assert tools["send_discord_reply"].execute.await_args.args[0]["reply_to_id"] == "40"
+
+
+@pytest.mark.asyncio
 async def test_short_watch_text_uses_normal_agent_processing(tmp_path):
     processor, ai, _ = make_processor(tmp_path, [decision(plan("wait"))])
     source = processor.world_state.get_channel("20").recent_messages[-1]
