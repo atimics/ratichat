@@ -88,6 +88,7 @@ class AppConfig(BaseSettings):
     RESEARCH_SOURCE_TTL_SECONDS: int = 300
     SOURCE_WATCH_DAILY_LOOKUP_BUDGET: int = 24
     LIVE_MONITOR_DAILY_LOOKUP_BUDGET: int = 7200
+    ONCHAIN_REQUEST_GAP_SECONDS: float = 1.0
     TRONGRID_API_KEY: Optional[str] = None
     BLOCKSCOUT_API_KEY: Optional[str] = None
     PROACTIVE_DISCORD_CHANNEL_IDS: str = ""

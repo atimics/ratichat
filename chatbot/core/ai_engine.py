@@ -875,7 +875,7 @@ Choose at most three actions in a step. Use wait when the request needs no reply
                         {"role": "user", "content": json.dumps(payload)}],
                         "response_format": {"type": "json_object"}, "max_tokens": 600})
                 response.raise_for_status()
-                value = self._extract_json_from_response(response.json()["choices"][0]["message"]["content"])
+                value = self._extract_json_with_field(response.json()["choices"][0]["message"]["content"], "tool")
                 return value if isinstance(value, dict) else None
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
             return None
@@ -891,10 +891,27 @@ Choose at most three actions in a step. Use wait when the request needs no reply
                         {"role": "user", "content": json.dumps(payload)}],
                         "response_format": {"type": "json_object"}, "max_tokens": 900})
                 response.raise_for_status()
-                value = self._extract_json_from_response(response.json()["choices"][0]["message"]["content"]).get("content")
+                value = self._extract_json_with_field(response.json()["choices"][0]["message"]["content"], "content").get("content")
                 return value[:2500] if isinstance(value, str) and value.strip() else None
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
             return None
+
+    def _extract_json_with_field(self, response: str, field: str) -> Dict[str, Any]:
+        """Read complete nested JSON objects, including replies with extra text."""
+        decoder, position, matches = json.JSONDecoder(), 0, []
+        while position < len(response):
+            start = response.find("{", position)
+            if start < 0:
+                break
+            try:
+                value, end = decoder.raw_decode(response[start:])
+            except json.JSONDecodeError:
+                position = start + 1
+                continue
+            position = start + end
+            if isinstance(value, dict) and field in value:
+                matches.append(value)
+        return matches[-1] if matches else self._extract_json_from_response(response)
 
     def _extract_json_from_response(self, response: str) -> Dict[str, Any]:
         """
