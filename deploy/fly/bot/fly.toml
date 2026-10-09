@@ -15,6 +15,7 @@ kill_timeout = 30
   MATRIX_BACKUP_INTERVAL_SECONDS = "86400"
   CHATBOT_DB_PATH = "/data/chatbot.db"
   CHATBOT_ENV = "production"
+  DISCORD_OWNER_USER_IDS = "1360632999720390918"
   FARCASTER_OUTBOUND_ENABLED = "false"
   LOG_LEVEL = "INFO"
   TELEGRAM_OFFSET_PATH = "/data/telegram_offset.txt"

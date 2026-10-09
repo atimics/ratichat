@@ -59,6 +59,22 @@ def test_quick_requests_keep_their_intake_order_and_snapshot(saved):
     assert store.claim("discord", "general")["id"] == second["id"]
 
 
+def test_commands_have_their_own_order_and_delivery_claim(saved):
+    store, _ = saved
+    request = store.enqueue("discord", "general", "ask", snapshot("ask"))
+    first = store.enqueue("discord", "general", "command1", snapshot("command1"), kind="command")
+    second = store.enqueue("discord", "general", "command2", snapshot("command2"), kind="command")
+    assert store.pending_channels(include_processing=False) == [{"platform": "discord", "channel_id": "general"}]
+    claim = store.claim("discord", "general", kind="command", include_processing=False)
+    assert claim["id"] == first["id"]
+    assert store.claim("discord", "general", kind="command") is None
+    assert store.ready(first["id"], claim["lease_token"], "Watch removed")
+    delivery = store.claim_delivery("discord", "general", kind="command")
+    assert store.sent(first["id"], delivery["delivery_token"], {"message_id": "receipt1"})
+    assert store.claim("discord", "general", kind="command")["id"] == second["id"]
+    assert store.get(request["id"])["attempts"] == 0
+
+
 def test_duplicate_intake_preserves_original_and_platform_scope(saved):
     store, _ = saved
     original = store.enqueue("discord", "general", "one", snapshot())

@@ -440,6 +440,8 @@ class MainOrchestrator:
         self.matrix_steward = MatrixSteward(settings, self.config.db_path)
         self.action_context.matrix_steward = self.matrix_steward
         self.steward_task = None
+        self.source_watch_service = None
+        self.source_watch_task = None
         
         # External observers
         self.matrix_observer: Optional[MatrixObserver] = None
@@ -655,6 +657,7 @@ class MainOrchestrator:
             
             # Set up processing hub with traditional processor
             self._setup_processing_components()
+            self.source_watch_task = asyncio.create_task(self._source_watch_loop())
             
             # Start the proactive conversation engine
             await self.proactive_engine.start()
@@ -678,6 +681,10 @@ class MainOrchestrator:
 
         # Stop processing hub
         self.processing_hub.stop_processing_loop()
+        if self.source_watch_task:
+            self.source_watch_task.cancel()
+            await asyncio.gather(self.source_watch_task, return_exceptions=True)
+            self.source_watch_task = None
         if self.steward_task:
             self.steward_task.cancel()
             await asyncio.gather(self.steward_task, return_exceptions=True)
@@ -734,7 +741,29 @@ class MainOrchestrator:
             self.world_state, self.payload_builder, traditional_processor, self.config.db_path,
             research_store=self.research_store,
         )
+        from ..node_system.source_watches import WatchStore, SourceWatchService
+        from ..node_system.watch_delivery import WatchDelivery
+        allowed_channels = {"discord": self.capability_policy.approved_discord_channel_ids,
+                            "matrix": self.capability_policy.approved_matrix_room_ids}
+        owner_ids = {"discord": {value.strip() for value in settings.DISCORD_OWNER_USER_IDS.split(",") if value.strip()},
+                     "matrix": self.capability_policy.operator_user_ids}
+        watch_store = WatchStore(self.config.db_path, owner_ids=owner_ids, allowed_channels=allowed_channels)
+        delivery = WatchDelivery(self.action_context, allowed_channels)
+        self.source_watch_service = SourceWatchService(watch_store, send=delivery.send,
+            reconcile=delivery.reconcile, action_context=self.action_context,
+            daily_lookup_budget=settings.SOURCE_WATCH_DAILY_LOOKUP_BUDGET)
+        node_processor.watch_service = self.source_watch_service
         self.processing_hub.set_node_processor(node_processor)
+
+    async def _source_watch_loop(self):
+        while self.running:
+            try:
+                await self.source_watch_service.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Source watch check needs another attempt")
+            await asyncio.sleep(60)
 
     async def _initialize_nft_services(self) -> None:
         """Initialize NFT and blockchain services if credentials are available."""

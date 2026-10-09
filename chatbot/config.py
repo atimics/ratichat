@@ -81,6 +81,7 @@ class AppConfig(BaseSettings):
     DISCORD_OWNER_USER_IDS: str = ""
     RESEARCH_RETENTION_DAYS: int = 7
     RESEARCH_SOURCE_TTL_SECONDS: int = 300
+    SOURCE_WATCH_DAILY_LOOKUP_BUDGET: int = 24
 
     # Telegram
     TELEGRAM_BOT_TOKEN: Optional[str] = None

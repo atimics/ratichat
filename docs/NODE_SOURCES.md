@@ -42,6 +42,28 @@ The same tools work in approved Matrix rooms. The app also supports Farcaster
 through its existing Neynar connection. X account access can be added as a
 separate source adapter when that account is connected.
 
+## Feed watches
+
+The owner can add RSS, Atom, or GitHub release watches in a configured channel:
+
+- `@ratichat watch https://github.com/python/cpython/releases.atom every 1h`
+- `@ratichat watches`
+- `@ratichat digest`
+- `@ratichat digest WATCH_ID`
+- `@ratichat unwatch WATCH_ID`
+
+These commands use the saved request queue and run directly from the human
+message. The first check saves a quiet baseline. Later checks post new entries
+with titles, short summaries, and links. `digest` shows the latest saved entries.
+Each update has a receipt and a fixed destination. Saved updates survive restarts.
+
+Set `DISCORD_OWNER_USER_IDS` to the owner's Discord user ID. Matrix watches use
+`MATRIX_OPERATOR_USER_IDS`. Owner IDs and channel IDs come from server settings.
+Each channel can have five watches. Intervals range from 15 minutes to 24 hours.
+Each channel gets 24 feed checks per UTC day by default. Set
+`SOURCE_WATCH_DAILY_LOOKUP_BUDGET` to change this limit. Polling uses public feed
+reads; chat research uses the linked AI account as before.
+
 ## Request scope
 
 Each request uses its own channel messages and its own fetched source results.

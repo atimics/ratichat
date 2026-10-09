@@ -385,3 +385,70 @@ async def test_traditional_mode_keeps_future_retry_in_saved_queue(tmp_path):
     traditional.process_payload.assert_not_awaited()
     ai.make_decision.assert_awaited_once()
     assert processor.research_store.state_counts() == {"queued": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sender,expected_count", [("50", 1), ("guest", 0)])
+async def test_watch_command_uses_saved_sender_and_runs_before_ai(tmp_path, sender, expected_count):
+    from chatbot.core.node_system.source_watches import WatchStore, SourceWatchService
+    processor, ai, tools = make_processor(tmp_path, [])
+    ai.api_key = None
+    source = processor.world_state.get_channel("20").recent_messages[-1]
+    source.sender = sender
+    source.content = "<@30> watch https://example.com/releases.atom every 1h"
+    source.metadata["bot_mentioned"] = True
+    store = WatchStore(processor.db_path, owner_ids={"discord": {"50"}}, allowed_channels={"discord": {"20"}})
+    processor.watch_service = SourceWatchService(store)
+    capture_request(processor.world_state, processor.policy, processor.research_store, "20", source)
+    assert processor.pending_channels() == ["20"]
+    await processor.process_cycle("watch", "20")
+    assert len(store.list({"channel_type": "discord", "channel_id": "20"})) == expected_count
+    reply = tools["send_discord_reply"].execute.await_args.args[0]
+    assert reply["reply_to_id"] == "40"
+    assert processor.research_store.state_counts() == {"sent": 1}
+    ai.make_decision.assert_not_awaited()
+    ai.compose_reply.assert_not_awaited()
+    assert (await processor.process_cycle("repeat", "20"))["duplicate"]
+
+
+@pytest.mark.asyncio
+async def test_owner_can_stop_watch_with_older_ai_request_waiting(tmp_path):
+    from chatbot.core.node_system.source_watches import WatchStore, SourceWatchService
+    processor, ai, tools = make_processor(tmp_path, [])
+    ai.api_key = None
+    original = processor.world_state.get_channel("20").recent_messages[-1]
+    capture_request(processor.world_state, processor.policy, processor.research_store, "20", original, accepted=True)
+    store = WatchStore(processor.db_path, owner_ids={"discord": {"50"}}, allowed_channels={"discord": {"20"}})
+    watch = store.create({"channel_type": "discord", "channel_id": "20", "sender_id": "50", "event_id": "create"},
+                         "https://example.com/feed", is_owner=True)
+    processor.watch_service = SourceWatchService(store)
+    processor.world_state.add_message("20", Message("41", "discord", "50", "unwatch " + watch["id"], time.time(),
+        channel_id="20", metadata={"bot_mentioned": True}))
+    await processor.process_cycle("stop-watch", "20")
+    assert store.list({"channel_type": "discord", "channel_id": "20"}) == []
+    assert tools["send_discord_reply"].execute.await_args.args[0]["reply_to_id"] == "41"
+    assert processor.research_store.state_counts() == {"queued": 1, "sent": 1}
+    ai.make_decision.assert_not_awaited()
+    assert processor.pending_channels() == []
+
+
+@pytest.mark.asyncio
+async def test_watch_command_error_retries_with_original_sender_and_target(tmp_path):
+    processor, ai, tools = make_processor(tmp_path, [])
+    ai.api_key = None
+    source = processor.world_state.get_channel("20").recent_messages[-1]
+    source.content = "watches"
+    processor.watch_service = SimpleNamespace(store=SimpleNamespace(owner_ids={"discord": {"50"}}),
+        manage=AsyncMock(side_effect=[RuntimeError("temporary database failure"), "This channel has zero watches."]))
+    processor.research_store.clock = lambda: 1000
+    first = await processor.process_cycle("first", "20")
+    assert first["failed"]
+    assert processor.research_store.state_counts() == {"queued": 1}
+    tools["send_discord_reply"].execute.assert_not_awaited()
+    processor.research_store.clock = lambda: 1011
+    await processor.process_cycle("retry", "20")
+    reply = tools["send_discord_reply"].execute.await_args.args[0]
+    assert reply["reply_to_id"] == "40"
+    assert reply["content"] == "This channel has zero watches."
+    assert processor.research_store.state_counts() == {"sent": 1}
+    ai.make_decision.assert_not_awaited()
