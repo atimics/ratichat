@@ -127,12 +127,14 @@ class NodeProcessor:
             return {"actions_executed": 0}
         if time.time() - self._last_receipt_check.get(primary_channel_id, 0) >= 60:
             await self._check_receipts(primary_channel_id)
-        delivery = self.research_store.claim_delivery(platform, primary_channel_id, lease_seconds=900)
+        delivery = (self.research_store.claim_delivery(platform, primary_channel_id, lease_seconds=900, kind="command")
+                    or self.research_store.claim_delivery(platform, primary_channel_id, lease_seconds=900, kind="request"))
         if delivery:
             result = await self._deliver(delivery)
             return self._result(1, 0, 0, failed=result.get("status") != "success")
-        turn = self.research_store.claim(platform, primary_channel_id, lease_seconds=900,
-                                         include_processing=bool(self.ai_engine.api_key))
+        turn = self.research_store.claim(platform, primary_channel_id, lease_seconds=900, kind="command")
+        if not turn and self.ai_engine.api_key:
+            turn = self.research_store.claim(platform, primary_channel_id, lease_seconds=900, kind="request")
         if not turn:
             return {"actions_executed": 0, "duplicate": True}
         saved = self._saved_channel(turn)
@@ -143,6 +145,11 @@ class NodeProcessor:
         self._restore_discord(turn)
         command = watch_command(turn["snapshot"]["source"]["content"])
         if command and self.watch_service:
+            return await self._process_watch_command(command, platform, saved, turn)
+        return await self._run_cycle(cycle_id, primary_channel_id, context, saved, turn)
+
+    async def _process_watch_command(self, command, platform, saved, turn):
+        try:
             source = turn["snapshot"]["source"]
             command_scope = {"channel_type": platform, "channel_id": saved.id,
                              "sender_id": source["sender"], "event_id": source["id"]}
@@ -155,7 +162,10 @@ class NodeProcessor:
                                 "format_as_markdown": False}, "Report the source-watch command result", 1)
             result = await self._save_and_send(reply, scope, turn, {})
             return self._result(1, 0, 0, failed=result.get("status") != "success")
-        return await self._run_cycle(cycle_id, primary_channel_id, context, saved, turn)
+        except Exception:
+            logger.exception("Source watch command needs another attempt")
+            self.research_store.fail(turn["id"], turn["lease_token"], "Watch command needs another attempt", retry_after=10 * turn["attempts"])
+            return self._result(0, 0, 0, failed=True)
 
     async def _save_and_send(self, action, scope, turn, sources):
         if turn is None:
@@ -169,7 +179,8 @@ class NodeProcessor:
         records = [data for path, data in sources.items() if path.startswith("sources.result_")]
         if not self.research_store.ready(turn["id"], turn["lease_token"], text, sources=records):
             return {"status": "blocked", "error": "The saved turn needs a current claim"}
-        delivery = self.research_store.claim_delivery(turn["platform"], turn["channel_id"], lease_seconds=900)
+        delivery = self.research_store.claim_delivery(turn["platform"], turn["channel_id"], lease_seconds=900,
+            kind="command" if turn["kind"] == "command" else "request")
         return await self._deliver(delivery) if delivery else {"status": "failure", "error": "Reply is saved for delivery"}
 
     async def _deliver(self, turn):

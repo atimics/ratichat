@@ -1,8 +1,11 @@
 """Deliver saved owner-created watch updates to their fixed channel."""
 
 import time
+import logging
 
 from ..world_state.structures import Message
+
+logger = logging.getLogger(__name__)
 
 
 class WatchDelivery:
@@ -27,8 +30,11 @@ class WatchDelivery:
         if result.get("status") == "success" and result.get("message_id"):
             world = getattr(self.context, "world_state_manager", None)
             if world and world.get_channel(channel_id):
-                world.add_message(channel_id, Message(str(result["message_id"]), platform, "ratichat", text,
-                    time.time(), channel_id=channel_id, metadata={"is_bot": True, "watch_id": watch_id}))
+                try:
+                    world.add_message(channel_id, Message(str(result["message_id"]), platform, "ratichat", text,
+                        time.time(), channel_id=channel_id, metadata={"is_bot": True, "watch_id": watch_id}))
+                except Exception:
+                    logger.warning("Watch history needs another update; platform receipt is saved")
         return result
 
     async def reconcile(self, watch_id, platform, channel_id, text, delivery_key):

@@ -1,7 +1,7 @@
 """Saved watch delivery uses the approved platform and a stable receipt key."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -35,3 +35,13 @@ async def test_removed_watch_channel_holds_receipt_and_skips_send():
     assert (await delivery.reconcile(*args))["status"] == "unknown"
     observer.send_digest.assert_not_awaited()
     observer.reconcile_digest.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_platform_receipt_survives_local_history_error():
+    observer = SimpleNamespace(send_message=AsyncMock(return_value={"success": True, "event_id": "$saved"}))
+    world = SimpleNamespace(get_channel=Mock(return_value=True), add_message=Mock(side_effect=RuntimeError("history error")))
+    delivery = WatchDelivery(SimpleNamespace(matrix_observer=observer, world_state_manager=world),
+                             {"matrix": {"!room:server"}})
+    receipt = await delivery.send("watch1", "matrix", "!room:server", "New entries", "key1")
+    assert receipt["status"] == "success" and receipt["message_id"] == "$saved"
