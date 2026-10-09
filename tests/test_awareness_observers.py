@@ -38,6 +38,8 @@ class MemoryStore:
             return {"changed": False}
         self.edits.append(copy.deepcopy(message))
         saved.update(content=message["content"], source_revision=revision)
+        if "image_urls" in message:
+            saved["image_urls"] = message["image_urls"]
         saved["metadata"].update(message["metadata"])
         return {"changed": True}
 
@@ -128,6 +130,11 @@ async def test_discord_edit_preserves_original_id_author_time_and_reply(discord_
     await discord_observer._handle_message_edit(discord_edit())
     saved = discord_observer.awareness_store.messages["discord", "20", "40"]
     assert saved["content"] == "A corrected message"
+    cached = discord_observer.world_state.get_channel("20").recent_messages[0]
+    cached.image_urls = ["https://example.test/old-image.png"]
+    discord_observer._handle_message_delete(SimpleNamespace(guild_id=10, channel_id=20, message_id=40))
+    assert cached.content == ""
+    assert cached.image_urls == []
     assert (saved["id"], saved["sender"], saved["timestamp"], saved["reply_to"]) == (
         before["id"], before["sender"], before["timestamp"], before["reply_to"])
     assert not discord_observer.can_reply("20", "40")
@@ -255,6 +262,32 @@ async def test_matrix_edits_require_original_author_and_valid_new_content(matrix
     await matrix_observer._on_message(room, matrix_event(event_id="$bad", content=replacement))
     assert not matrix_observer.awareness_store.edits
     assert len(matrix_observer.world_state.get_channel(room.room_id).recent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_matrix_replacement_retires_previous_image_evidence(matrix_observer):
+    room = nio.MatrixRoom("!general:example.test", matrix_observer.user_id)
+    await matrix_observer._on_message(room, matrix_event(stamp=100_000))
+    saved = matrix_observer.awareness_store.messages["matrix", room.room_id, "$original"]
+    saved["image_urls"] = ["https://example.test/old-image.png"]
+    saved["metadata"]["original_filename"] = "old-image.png"
+    cached = matrix_observer.world_state.get_channel(room.room_id).recent_messages[0]
+    cached.image_urls = list(saved["image_urls"])
+    cached.metadata["original_filename"] = "old-image.png"
+    await matrix_observer._on_message(room, matrix_event(event_id="$edit", stamp=101_000,
+        content={"msgtype": "m.text", "body": "* Changed",
+                 "m.new_content": {"msgtype": "m.text", "body": "Changed"},
+                 "m.relates_to": {"rel_type": "m.replace", "event_id": "$original"}}))
+    assert saved["image_urls"] == []
+    assert saved["metadata"]["original_filename"] is None
+    assert cached.image_urls == []
+    assert "original_filename" not in cached.metadata
+    cached.image_urls = ["https://example.test/old-image.png"]
+    await matrix_observer._on_redaction(room, nio.Event.parse_event({
+        "type": "m.room.redaction", "event_id": "$redaction", "sender": "@moderator:example.test",
+        "origin_server_ts": 102_000, "content": {}, "redacts": "$original"}))
+    assert cached.content == ""
+    assert cached.image_urls == []
 
 
 @pytest.mark.asyncio
