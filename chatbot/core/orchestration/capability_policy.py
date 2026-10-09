@@ -5,8 +5,11 @@ from typing import Any, Collection, Mapping
 
 
 READ_ONLY_SOURCE_TOOLS = frozenset({"web_search", "read_webpage", "read_feed"})
+WATCH_READ_TOOLS = frozenset({"list_source_watches", "get_source_digest"})
+WATCH_WRITE_TOOLS = frozenset({"create_source_watch", "remove_source_watch"})
+SOURCE_WATCH_TOOLS = WATCH_READ_TOOLS | WATCH_WRITE_TOOLS
 
-PUBLIC_BOT_ALLOWED_TOOLS = READ_ONLY_SOURCE_TOOLS | frozenset(
+PUBLIC_BOT_ALLOWED_TOOLS = READ_ONLY_SOURCE_TOOLS | SOURCE_WATCH_TOOLS | frozenset(
     {
         "wait",
         "send_matrix_reply",
@@ -49,6 +52,7 @@ class CapabilityPolicy:
         operator_user_ids: Collection[str] = (),
         managed_room_ids: Collection[str] = (),
         approved_discord_channel_ids: Collection[str] = (),
+        discord_owner_user_ids: Collection[str] = (),
     ) -> None:
         normalized_profile = profile.strip().lower()
         if normalized_profile not in self.SUPPORTED_PROFILES:
@@ -60,6 +64,7 @@ class CapabilityPolicy:
         self.approved_discord_channel_ids = frozenset(
             value.strip() for value in approved_discord_channel_ids if value.strip()
         )
+        self.discord_owner_user_ids = frozenset(value.strip() for value in discord_owner_user_ids if value.strip())
         self.control_room_id = control_room_id
         self.operator_user_ids = frozenset(value.strip() for value in operator_user_ids if value.strip())
         self.managed_room_ids = frozenset(value.strip() for value in managed_room_ids if value.strip())
@@ -80,15 +85,28 @@ class CapabilityPolicy:
     def filter_tool_names(self, tool_names: Collection[str], execution_scope=None) -> set[str]:
         """Return the names that may be shown to and used by the model."""
         if execution_scope and execution_scope.channel_type == "discord":
-            return set(tool_names) & ({"wait", "send_discord_reply"} | READ_ONLY_SOURCE_TOOLS)
+            tool_names = set(tool_names) & ({"wait", "send_discord_reply"} | READ_ONLY_SOURCE_TOOLS | SOURCE_WATCH_TOOLS)
         return {
             name for name in tool_names
             if self.allows(name) and (
                 self.profile != "matrix_steward"
                 or name not in MATRIX_MANAGEMENT_TOOLS
                 or self._operator_scope(execution_scope)
-            )
+            ) and (name not in SOURCE_WATCH_TOOLS or self._watch_scope(execution_scope))
+            and (name not in WATCH_WRITE_TOOLS or self._watch_owner_scope(execution_scope))
         }
+
+    def _watch_scope(self, scope: ExecutionScope | None) -> bool:
+        return bool(scope and scope.latest_event_id and scope.latest_sender_id and (
+            scope.channel_type == "discord" and scope.channel_id in self.approved_discord_channel_ids
+            or scope.channel_type == "matrix" and scope.channel_id in self.approved_matrix_room_ids
+        ))
+
+    def _watch_owner_scope(self, scope: ExecutionScope | None) -> bool:
+        if not self._watch_scope(scope):
+            return False
+        owners = self.discord_owner_user_ids if scope.channel_type == "discord" else self.operator_user_ids
+        return scope.latest_sender_id in owners
 
     def _operator_scope(self, scope: ExecutionScope | None) -> bool:
         return bool(
@@ -146,6 +164,14 @@ class CapabilityPolicy:
                 f"Tool '{tool_name}' is blocked by the "
                 f"'{self.profile}' capability profile"
             )
+        if tool_name in SOURCE_WATCH_TOOLS:
+            if not self._watch_scope(execution_scope):
+                return "Use a current request in a configured Discord or Matrix channel"
+            if tool_name in WATCH_WRITE_TOOLS and not self._watch_owner_scope(execution_scope):
+                return "The bot owner can add or remove source watches"
+            if set(parameters) & {"channel_id", "channel_type", "sender_id", "event_id", "source_event_id", "is_owner"}:
+                return "Use the sender and channel from the current request"
+            return None
         if execution_scope and execution_scope.channel_type == "discord" and tool_name not in ({"wait", "send_discord_reply"} | READ_ONLY_SOURCE_TOOLS):
             return "Use a Discord reply for this request"
         if tool_name in READ_ONLY_SOURCE_TOOLS:

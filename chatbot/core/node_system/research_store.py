@@ -176,21 +176,18 @@ class ResearchStore:
             WHERE status='effect_started' AND lease_until<=?""", (now, now, now))
 
     @staticmethod
-    def _first_active(db, platform: str, channel_id: str, kind: str | None = None):
+    def _first_active(db, platform: str, channel_id: str):
         return db.execute("""SELECT * FROM research_turns WHERE platform=? AND channel_id=?
-            AND (? IS NULL OR (kind='command')=?)
-            AND status IN ('queued','running','effect_started','ready','sending') ORDER BY id LIMIT 1""", (platform, channel_id, kind, kind == "command")).fetchone()
+            AND status IN ('queued','running','effect_started','ready','sending') ORDER BY id LIMIT 1""", (platform, channel_id)).fetchone()
 
-    def claim(self, platform: str, channel_id: str, *, lease_seconds: float = 120, include_processing: bool = True, kind: str | None = None) -> dict | None:
+    def claim(self, platform: str, channel_id: str, *, lease_seconds: float = 120) -> dict | None:
         """Claim the oldest request with a new token and a limited lease."""
         platform, channel_id = self._scope(platform, channel_id)
         now = self.clock()
         with self._transaction() as db:
             self._recover_expired(db, now)
-            row = self._first_active(db, platform, channel_id, kind)
+            row = self._first_active(db, platform, channel_id)
             if row is None or row["status"] != "queued" or row["retry_at"] > now:
-                return None
-            if not include_processing and row["kind"] != "command":
                 return None
             token = uuid.uuid4().hex
             db.execute("""UPDATE research_turns SET status='running',attempts=attempts+1,
@@ -237,13 +234,13 @@ class ResearchStore:
                 (reply, encoded, now, turn_id, lease_token, now)).rowcount
             return bool(changed)
 
-    def claim_delivery(self, platform: str, channel_id: str, *, lease_seconds: float = 120, kind: str | None = None) -> dict | None:
+    def claim_delivery(self, platform: str, channel_id: str, *, lease_seconds: float = 120) -> dict | None:
         """Claim the prepared reply. A send has its own lease token."""
         platform, channel_id = self._scope(platform, channel_id)
         now = self.clock()
         with self._transaction() as db:
             self._recover_expired(db, now)
-            row = self._first_active(db, platform, channel_id, kind)
+            row = self._first_active(db, platform, channel_id)
             if row is None or row["status"] != "ready" or row["retry_at"] > now:
                 return None
             token = uuid.uuid4().hex
@@ -331,10 +328,9 @@ class ResearchStore:
             self._recover_expired(db, now)
             rows = db.execute("""SELECT t.platform,t.channel_id FROM research_turns t
                 WHERE t.status IN ('queued','ready') AND t.retry_at<=?
-                AND (t.status='ready' OR t.kind='command' OR ?)
+                AND (t.status='ready' OR ?)
                 AND t.id=(SELECT MIN(first.id) FROM research_turns first
                     WHERE first.platform=t.platform AND first.channel_id=t.channel_id
-                    AND (first.kind='command')=(t.kind='command')
                     AND first.status IN ('queued','running','effect_started','ready','sending')) ORDER BY t.id""", (now, include_processing)).fetchall()
             return [dict(row) for row in rows]
 
