@@ -132,11 +132,12 @@ def _digest(watch, items, latest=False):
 class WatchStore:
     """SQLite watch state. Writes require a configured owner and channel."""
 
-    def __init__(self, db_path, owner_ids=None, allowed_channels=None, now=time.time):
+    def __init__(self, db_path, owner_ids=None, allowed_channels=None, now=time.time, kind="feed"):
         self.db_path = str(db_path)
         self.owner_ids = owner_ids or {}
         self.allowed_channels = allowed_channels or {}
         self.now = now
+        self.kind = kind
         self._memory = sqlite3.connect(":memory:") if self.db_path == ":memory:" else None
         with self._db() as db:
             db.executescript("""
@@ -175,7 +176,10 @@ class WatchStore:
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(source_watches)")}
             for name, declaration in (("reconcile_after", "REAL NOT NULL DEFAULT 0"),
-                                      ("reconcile_attempts", "INTEGER NOT NULL DEFAULT 0")):
+                                      ("reconcile_attempts", "INTEGER NOT NULL DEFAULT 0"),
+                                      ("kind", "TEXT NOT NULL DEFAULT 'feed'"),
+                                      ("config_json", "TEXT NOT NULL DEFAULT '{}'"),
+                                      ("check_state", "TEXT NOT NULL DEFAULT '{}'")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE source_watches ADD COLUMN {name} {declaration}")
 
@@ -220,8 +224,8 @@ class WatchStore:
             raise ValueError("This channel has five watches. Remove a saved watch before adding another")
         watch_id = uuid.uuid4().hex[:12]
         now = self.now()
-        db.execute("INSERT INTO source_watches (id,channel_type,channel_id,owner_id,request_event_id,url,interval_seconds,created_at,next_due) VALUES (?,?,?,?,?,?,?,?,?)",
-                   (watch_id, scope["channel_type"], scope["channel_id"], scope["sender_id"], scope["event_id"], url, interval_seconds, now, now))
+        db.execute("INSERT INTO source_watches (id,channel_type,channel_id,owner_id,request_event_id,url,interval_seconds,created_at,next_due,kind) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                   (watch_id, scope["channel_type"], scope["channel_id"], scope["sender_id"], scope["event_id"], url, interval_seconds, now, now, self.kind))
         return dict(db.execute("SELECT * FROM source_watches WHERE id=?", (watch_id,)).fetchone()), True
 
     def execute_mutation(self, tool_name, params, scope, is_owner=False):
@@ -244,8 +248,8 @@ class WatchStore:
                     result = {"status": "success", "message": "The feed watch is saved. Its first check saves a quiet baseline." if created else "The feed watch is already saved.",
                               "watch": _public_watch(watch), "created": created}
                 else:
-                    removed = db.execute("DELETE FROM source_watches WHERE id=? AND channel_type=? AND channel_id=?",
-                                         (params["watch_id"], scope["channel_type"], scope["channel_id"])).rowcount == 1
+                    removed = db.execute("DELETE FROM source_watches WHERE id=? AND channel_type=? AND channel_id=? AND kind=?",
+                                         (params["watch_id"], scope["channel_type"], scope["channel_id"], self.kind)).rowcount == 1
                     result = {"status": "success" if removed else "failure", "message": "The feed watch was removed." if removed else "Choose a source watch ID from this channel.",
                               "watch_id": params["watch_id"], "removed": removed}
             except ValueError as error:
@@ -271,14 +275,14 @@ class WatchStore:
     def list(self, scope):
         scope = self._check_scope(scope)
         with self._db() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM source_watches WHERE channel_type=? AND channel_id=? ORDER BY created_at,id",
-                                                   (scope["channel_type"], scope["channel_id"]))]
+            return [dict(row) for row in db.execute("SELECT * FROM source_watches WHERE channel_type=? AND channel_id=? AND kind=? ORDER BY created_at,id",
+                                                   (scope["channel_type"], scope["channel_id"], self.kind))]
 
     def remove(self, scope, watch_id, is_owner=False):
         scope = self._check_scope(scope, is_owner, write=True)
         with self._db() as db:
-            return db.execute("DELETE FROM source_watches WHERE id=? AND channel_type=? AND channel_id=?",
-                              (watch_id, scope["channel_type"], scope["channel_id"])).rowcount == 1
+            return db.execute("DELETE FROM source_watches WHERE id=? AND channel_type=? AND channel_id=? AND kind=?",
+                              (watch_id, scope["channel_type"], scope["channel_id"], self.kind)).rowcount == 1
 
     def claim(self, pending=False, lease_seconds=180):
         now = self.now()
@@ -288,7 +292,7 @@ class WatchStore:
             db.execute("UPDATE source_watches SET pending_status='unknown',lease_token=NULL,lease_until=0,reconcile_after=0,reconcile_attempts=0 WHERE pending_status='sending' AND lease_until<=?", (now,))
             db.execute("UPDATE source_watch_deliveries SET status='unknown' WHERE status='sending' AND delivery_key IN (SELECT delivery_key FROM source_watches WHERE pending_status='unknown')")
             state = "pending_status='pending'" if pending else "pending_status IS NULL"
-            rows = db.execute(f"SELECT * FROM source_watches WHERE {state} AND next_due<=? AND lease_until<=? ORDER BY next_due,id", (now, now)).fetchall()
+            rows = db.execute(f"SELECT * FROM source_watches WHERE {state} AND kind=? AND next_due<=? AND lease_until<=? ORDER BY next_due,id", (self.kind, now, now)).fetchall()
             row = next((row for row in rows if _allowed(self.allowed_channels, row["channel_type"], row["channel_id"])
                         and _allowed(self.owner_ids, row["channel_type"], row["owner_id"])), None)
             if row is None:
@@ -302,6 +306,8 @@ class WatchStore:
     def reserve_lookup(self, scope, limit):
         scope = self._check_scope(scope)
         day = datetime.fromtimestamp(self.now(), timezone.utc).date().isoformat()
+        if self.kind != "feed":
+            day = self.kind + ":" + day
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             key = (day, scope["channel_type"], scope["channel_id"])
@@ -377,7 +383,7 @@ class WatchStore:
 
     def uncertain_deliveries(self):
         with self._db() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM source_watches WHERE pending_status='unknown' ORDER BY reconcile_after,id")
+            return [dict(row) for row in db.execute("SELECT * FROM source_watches WHERE pending_status='unknown' AND kind=? ORDER BY reconcile_after,id", (self.kind,))
                     if _allowed(self.allowed_channels, row["channel_type"], row["channel_id"])
                     and _allowed(self.owner_ids, row["channel_type"], row["owner_id"])]
 
@@ -386,7 +392,7 @@ class WatchStore:
         now = self.now()
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            rows = db.execute("SELECT * FROM source_watches WHERE pending_status='unknown' AND reconcile_after<=? ORDER BY reconcile_after,id", (now,)).fetchall()
+            rows = db.execute("SELECT * FROM source_watches WHERE pending_status='unknown' AND kind=? AND reconcile_after<=? ORDER BY reconcile_after,id", (self.kind, now)).fetchall()
             claimed = []
             for row in rows:
                 if not _allowed(self.allowed_channels, row["channel_type"], row["channel_id"]) or not _allowed(self.owner_ids, row["channel_type"], row["owner_id"]):
@@ -472,47 +478,52 @@ class SourceWatchService:
 
     async def tick(self):
         async with self._tick_lock:
-            # Bound each wake even when several watches are due after a restart.
+            await self.deliver_pending()
+            await self.poll_due()
+
+    async def deliver_pending(self):
+        for _ in range(5):
+            watch = self.store.claim(pending=True)
+            if watch is None:
+                break
+            await self._deliver(watch)
+        if self.reconcile:
             for _ in range(5):
-                watch = self.store.claim(pending=True)
-                if watch is None:
+                claimed = self.store.claim_uncertain(limit=1, minimum_delay=max(60, self.callback_timeout + 5))
+                if not claimed:
                     break
-                await self._deliver(watch)
-            if self.reconcile:
-                for _ in range(5):
-                    claimed = self.store.claim_uncertain(limit=1, minimum_delay=max(60, self.callback_timeout + 5))
-                    if not claimed:
-                        break
-                    watch = claimed[0]
-                    try:
-                        result = await asyncio.wait_for(self.reconcile(watch["id"], watch["channel_type"], watch["channel_id"], watch["pending_text"], watch["delivery_key"]), timeout=self.callback_timeout)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        continue
-                    if isinstance(result, dict):
-                        status = result.get("status", "unknown")
-                        if status in {"success", "sent", "failure"}:
-                            self.store.reconcile_delivery(watch["delivery_key"], status, result.get("message_id"))
-            for _ in range(5):
-                watch = self.store.claim()
-                if watch is None:
-                    break
-                if not self.store.reserve_lookup(watch, self.daily_lookup_budget):
-                    tomorrow = (int(self.now()) // 86400 + 1) * 86400
-                    self.store.defer(watch, max(60, tomorrow - self.now()))
-                    continue
+                watch = claimed[0]
                 try:
-                    result = await self.fetch(watch["url"])
-                    if not isinstance(result, dict) or result.get("status") != "success":
-                        self.store.defer(watch, min(900, watch["interval_seconds"]))
-                        continue
-                    prepared = self.store.save_feed(watch, _items(result, watch["url"]))
+                    result = await asyncio.wait_for(self.reconcile(watch["id"], watch["channel_type"], watch["channel_id"], watch["pending_text"], watch["delivery_key"]), timeout=self.callback_timeout)
                 except asyncio.CancelledError:
-                    self.store.defer(watch)
                     raise
                 except Exception:
+                    continue
+                if isinstance(result, dict):
+                    status = result.get("status", "unknown")
+                    if status in {"success", "sent", "failure"}:
+                        self.store.reconcile_delivery(watch["delivery_key"], status, result.get("message_id"))
+
+    async def poll_due(self):
+        for _ in range(5):
+            watch = self.store.claim()
+            if watch is None:
+                break
+            if not self.store.reserve_lookup(watch, self.daily_lookup_budget):
+                tomorrow = (int(self.now()) // 86400 + 1) * 86400
+                self.store.defer(watch, max(60, tomorrow - self.now()))
+                continue
+            try:
+                result = await self.fetch(watch["url"])
+                if not isinstance(result, dict) or result.get("status") != "success":
                     self.store.defer(watch, min(900, watch["interval_seconds"]))
                     continue
-                if prepared:
-                    await self._deliver(prepared)
+                prepared = self.store.save_feed(watch, _items(result, watch["url"]))
+            except asyncio.CancelledError:
+                self.store.defer(watch)
+                raise
+            except Exception:
+                self.store.defer(watch, min(900, watch["interval_seconds"]))
+                continue
+            if prepared:
+                await self._deliver(prepared)

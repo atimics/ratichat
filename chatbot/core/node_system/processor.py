@@ -366,6 +366,7 @@ class NodeProcessor:
             "sources.feeds": {"description": "Read news, blogs, or GitHub release RSS/Atom feeds with read_feed."},
             "sources.news": {"description": "Use read_news for BBC News, BBC Technology, Hacker News, and CoinDesk headlines."},
             "sources.social": {"description": "Use search_social for indexed public Reddit, Farcaster, X, or Bluesky pages and posts. Use read_bluesky_feed for a public author feed."},
+            "sources.onchain": {"description": "Use check_onchain_activity for live address transactions. Use create_live_monitor to save recurring checks and automatic updates in this channel."},
         }
         if turn:
             sources["channel.memory"] = self.research_store.memory_node(channel.type, channel.id)
@@ -380,6 +381,11 @@ class NodeProcessor:
         proactive_scope = {"channel_type": scope.channel_type, "channel_id": scope.channel_id,
                            "sender_id": scope.latest_sender_id, "event_id": scope.latest_event_id}
         proactive_available = proactive and scope.channel_type == "discord" and scope.channel_id in proactive.store.allowed_channels
+        monitors = getattr(self.executor.action_context, "live_monitor_service", None)
+        monitors_available = monitors and scope.channel_type in {"discord", "matrix"} and scope.channel_id in monitors.store.allowed_channels.get(scope.channel_type, ())
+        if monitors_available:
+            from .live_monitors import public_monitor
+            sources["sources.monitors"] = {"monitors": [public_monitor(m) for m in monitors.store.list(proactive_scope)]}
         if proactive_available:
             sources["sources.proactive"] = proactive.store.status(proactive_scope)
         if turn:
@@ -392,6 +398,10 @@ class NodeProcessor:
                         saved_watch_results.append(data)
             if proactive_available:
                 for data in proactive.store.tool_results(proactive_scope):
+                    if data not in saved_watch_results:
+                        saved_watch_results.append(data)
+            if monitors_available:
+                for data in monitors.store.tool_results(proactive_scope):
                     if data not in saved_watch_results:
                         saved_watch_results.append(data)
             for index, data in enumerate(saved_watch_results, 1):
@@ -490,6 +500,8 @@ class NodeProcessor:
                         sources["sources.watches"] = self._watch_node(channel)
                     if proactive_available:
                         sources["sources.proactive"] = proactive.store.status(proactive_scope)
+                    if monitors_available:
+                        sources["sources.monitors"] = {"monitors": [public_monitor(m) for m in monitors.store.list(proactive_scope)]}
                     # The next AI step sees the actual result before writing its reply.
                     continue
                 # A reply selected alongside a lookup is based on stale context.
@@ -508,7 +520,7 @@ class NodeProcessor:
                         lookups += 1
                         parameters = dict(action.parameters)
                         fresh = parameters.pop("fresh", False)
-                        cached = self.research_store.cached_source(channel.type, channel.id, action.action_type, parameters) if turn and not fresh else None
+                        cached = self.research_store.cached_source(channel.type, channel.id, action.action_type, parameters) if turn and not fresh and action.action_type != "check_onchain_activity" else None
                         if cached:
                             result = {**cached["result"], "cached": True, "fetched_at": cached["fetched_at"], "expires_at": cached["expires_at"]}
                         else:
