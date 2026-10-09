@@ -38,9 +38,46 @@ Mention RatiChat in a configured channel:
 - `@ratichat Summarise https://www.python.org/about/`
 - `@ratichat Read https://github.com/python/cpython/releases.atom and show the latest three releases.`
 
-The same tools work in approved Matrix rooms. The app also supports Farcaster
+The same source readers work in approved Matrix rooms. The app also supports Farcaster
 through its existing Neynar connection. X account access can be added as a
 separate source adapter when that account is connected.
+
+## Public news and social sources
+
+The agent has `list_public_sources`, `read_news`, `search_social`, and
+`read_bluesky_feed`. News readers cover BBC News, BBC Technology, Hacker News,
+and CoinDesk. Each story has a source link and publisher credit. Bluesky author
+feeds use its public API. Reddit, X, Farcaster, and Bluesky search uses indexed
+public posts through the linked web search account. Results include the access
+type and source links, so the agent can describe their coverage clearly.
+
+Ask in plain English, such as “What is happening in world news?”, “Find Reddit
+discussions about Python”, or “Read the latest posts from bsky.app on Bluesky.”
+These readers share the node processor's three-lookup limit and saved source cache.
+
+## Proactive speaking
+
+RatiChat can share a useful public story and invite discussion in a configured
+Discord channel. It rotates through tech, AI, developer news, crypto, Reddit,
+social discussions, and world news. Its public source node holds the material
+for each post. The model chooses one story or waits for better material.
+
+Posts run from 08:00 to 22:00 in `PROACTIVE_TIMEZONE`, with a three-hour gap and
+at most four posts per local day. Each channel gets at most eight source checks
+and AI decision attempts per day, including at most three public web searches.
+The server adds a publisher credit, source link, and receipt. Saved drafts and
+delivery receipts survive restarts. An uncertain send gets a receipt check.
+
+Set `PROACTIVE_DISCORD_CHANNEL_IDS` to approved Discord channels and
+`PROACTIVE_PUBLIC_SOURCES_ENABLED=true` to seed their first settings. The Fly
+deployment enables `#general` with `America/Vancouver` daytime hours. Saved
+owner settings carry across deployments.
+
+The agent has `configure_proactive` and `get_proactive_status`. Owners can ask
+“Pause proactive speaking”, “Focus on AI and crypto”, or “Keep it to two posts
+per day”. People in the channel can ask about its current topics and limits.
+The saved sender and channel control these tools. Each settings change and its
+receipt share one transaction, and retries restore that receipt before replying.
 
 ## Feed watches
 
