@@ -440,13 +440,16 @@ class MatrixObserver(Integration):
         try:
             result = self.awareness_store.edit_message("matrix", room_id, target,
                 {"sender": event.sender, "content": new_content["body"][:4000],
-                 "source_revision": stamp / 1000,
+                 "source_revision": stamp / 1000, "image_urls": [],
                  "metadata": {"matrix_event_type": new_content.get("msgtype", "m.text"),
-                              "edit_event_id": event.event_id, "edited_at": stamp / 1000}})
+                              "edit_event_id": event.event_id, "edited_at": stamp / 1000,
+                              "original_filename": None}})
             if result.get("changed") and channel:
                 for item in channel.recent_messages:
                     if item.id == target:
                         item.content = new_content["body"][:4000]
+                        item.image_urls = []
+                        item.metadata.pop("original_filename", None)
                         item.metadata.update(edit_event_id=event.event_id, edited_at=stamp / 1000)
         except Exception:
             logger.warning("Matrix message edit needs another save attempt")
@@ -486,6 +489,8 @@ class MatrixObserver(Integration):
                     for item in channel.recent_messages:
                         if item.id == target:
                             item.content = ""
+                            item.image_urls = []
+                            item.arweave_media_attachments = []
                             item.metadata = {"deleted": True, "historical": True}
         except Exception:
             logger.warning("Matrix message deletion needs another save attempt")

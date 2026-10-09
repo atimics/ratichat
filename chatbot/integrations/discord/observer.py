@@ -231,6 +231,8 @@ class DiscordObserver(Integration):
             for item in channel.recent_messages:
                 if item.id == str(message_id):
                     item.content = ""
+                    item.image_urls = []
+                    item.arweave_media_attachments = []
                     item.metadata = {"deleted": True, "historical": True}
         if self.awareness_store:
             try:
