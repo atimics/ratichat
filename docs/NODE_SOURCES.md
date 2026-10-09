@@ -1,5 +1,8 @@
 # Node processing and public sources
 
+See [Shared awareness and task model routing](SHARED_AWARENESS.md) for the
+proposed common store, saved channel views, Jev decisions, and task model choices.
+
 RatiChat uses the node processor for chat requests. Each request opens its own
 channel node. Source nodes start as short descriptions. RatiChat can expand,
 collapse, pin, and unpin the nodes listed for that request.
