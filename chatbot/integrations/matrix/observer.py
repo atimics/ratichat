@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -18,10 +19,13 @@ import httpx
 from dotenv import load_dotenv
 from nio import (
     AsyncClient,
+    BadEvent,
     LoginResponse,
     MatrixRoom,
     RoomMessageImage,
     RoomMessageText,
+    RedactedEvent,
+    RedactionEvent,
     RoomSendError,
     RoomSendResponse,
 )
@@ -53,6 +57,7 @@ class MatrixObserver(Integration):
         super().__init__(integration_id, display_name, config or {})
         # Assign world state manager and optional Arweave client
         self.world_state = world_state_manager
+        self.awareness_store = None
         self.arweave_client = arweave_client
         self.homeserver = settings.MATRIX_HOMESERVER
         self.user_id = settings.MATRIX_USER_ID
@@ -112,6 +117,7 @@ class MatrixObserver(Integration):
         # Set up event callbacks
         self.client.add_event_callback(self._on_message, RoomMessageText)
         self.client.add_event_callback(self._on_message, RoomMessageImage)
+        self.client.add_event_callback(self._on_redaction, (RedactionEvent, RedactedEvent, BadEvent))
 
         # Import required Matrix event types
         from nio import InviteMemberEvent, RoomMemberEvent
@@ -264,6 +270,16 @@ class MatrixObserver(Integration):
         if event.sender == self.user_id:
             return
 
+        source = getattr(event, "source", {})
+        source = source if isinstance(source, dict) else {}
+        event_content = source.get("content", {})
+        event_content = event_content if isinstance(event_content, dict) else {}
+        relation = event_content.get("m.relates_to", {})
+        relation = relation if isinstance(relation, dict) else {}
+        if relation.get("rel_type") == "m.replace":
+            self._save_edit(room.room_id, event, event_content, relation)
+            return
+
         # Extract comprehensive room details
         room_details = self._extract_room_details(room)
 
@@ -384,11 +400,19 @@ class MatrixObserver(Integration):
             channel_type="matrix",
             sender=event.sender,
             content=content,
-            timestamp=time.time(),
-            reply_to=None,  # TODO: Extract reply information if present
+            timestamp=server_time / 1000 if isinstance(server_time, (int, float)) else time.time(),
+            reply_to=relation.get("m.in_reply_to", {}).get("event_id") if isinstance(relation.get("m.in_reply_to"), dict) else None,
             image_urls=image_urls_list if image_urls_list else None,
             metadata=metadata,
         )
+
+        if self.awareness_store:
+            try:
+                saved = self.awareness_store.ingest_message("matrix", room.room_id, asdict(message))
+                if isinstance(saved, dict) and saved.get("deleted"):
+                    return
+            except Exception:
+                logger.warning("Matrix awareness intake needs another save attempt")
 
         # Add to world state
         self.world_state.add_message(room.room_id, message)
@@ -401,6 +425,70 @@ class MatrixObserver(Integration):
             f"MatrixObserver: New message in {room.display_name or room.room_id}: "
             f"{event.sender}: {log_content}"
         )
+
+    def _save_edit(self, room_id, event, event_content, relation):
+        new_content = event_content.get("m.new_content")
+        target = relation.get("event_id")
+        stamp = getattr(event, "server_timestamp", None)
+        if (not self.awareness_store or not isinstance(target, str) or not target
+                or not isinstance(new_content, dict) or not isinstance(new_content.get("body"), str)
+                or not isinstance(stamp, (int, float))):
+            return
+        channel = self.world_state.get_channel(room_id)
+        if channel and any(item.id == target and item.sender != event.sender for item in channel.recent_messages):
+            return
+        try:
+            result = self.awareness_store.edit_message("matrix", room_id, target,
+                {"sender": event.sender, "content": new_content["body"][:4000],
+                 "source_revision": stamp / 1000,
+                 "metadata": {"matrix_event_type": new_content.get("msgtype", "m.text"),
+                              "edit_event_id": event.event_id, "edited_at": stamp / 1000}})
+            if result.get("changed") and channel:
+                for item in channel.recent_messages:
+                    if item.id == target:
+                        item.content = new_content["body"][:4000]
+                        item.metadata.update(edit_event_id=event.event_id, edited_at=stamp / 1000)
+        except Exception:
+            logger.warning("Matrix message edit needs another save attempt")
+
+    async def _on_redaction(self, room, event):
+        if not self.awareness_store or room.room_id == settings.MATRIX_ADMIN_ROOM_ID:
+            return
+        if settings.BOT_CAPABILITY_PROFILE == "matrix_steward":
+            approved = {value.strip() for value in settings.PUBLIC_MATRIX_ROOM_IDS.split(",") if value.strip()}
+            if room.room_id not in approved:
+                return
+        source = getattr(event, "source", {})
+        if not isinstance(source, dict):
+            return
+        content = source.get("content", {})
+        content = content if isinstance(content, dict) else {}
+        if source.get("type") == "m.room.redaction":
+            target = content.get("redacts") or source.get("redacts") or getattr(event, "redacts", None)
+        elif isinstance(event, RedactedEvent):
+            target = event.event_id
+            unsigned = source.get("unsigned", {})
+            redaction = unsigned.get("redacted_because", {}) if isinstance(unsigned, dict) else {}
+            if isinstance(redaction, dict):
+                source = redaction
+        else:
+            return
+        stamp = source.get("origin_server_ts", getattr(event, "server_timestamp", None))
+        if not isinstance(target, str) or not target:
+            return
+        try:
+            self.awareness_store.delete_message("matrix", room.room_id, target,
+                sender_id=source.get("sender", getattr(event, "sender", None)),
+                timestamp=stamp / 1000 if isinstance(stamp, (int, float)) else time.time())
+            if self.world_state:
+                channel = self.world_state.get_channel(room.room_id)
+                if channel:
+                    for item in channel.recent_messages:
+                        if item.id == target:
+                            item.content = ""
+                            item.metadata = {"deleted": True, "historical": True}
+        except Exception:
+            logger.warning("Matrix message deletion needs another save attempt")
 
     async def _on_invite(self, room, event):
         """Handle incoming Matrix room invites"""
