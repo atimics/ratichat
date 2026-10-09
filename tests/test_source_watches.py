@@ -1,12 +1,14 @@
 """Feed watch authority, quiet baselines, saved updates, and recovery."""
 
 import asyncio
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from chatbot.core.node_system.source_watches import HELP, SourceWatchService, WatchStore, _digest, _items
+from chatbot.core.node_system.source_watches import SourceWatchService, WatchStore, _digest, _items
 
 
 FEED = "https://example.com/releases.atom"
@@ -79,13 +81,14 @@ def test_channel_scope_applies_to_reads_and_removal(tmp_path):
     assert store.remove(scope(), watch["id"], is_owner=True)
 
 
-def test_create_receipt_and_url_are_idempotent(tmp_path):
+def test_same_event_supports_two_feeds_and_url_duplicates_stay_one_watch(tmp_path):
     store = make_store(tmp_path, Clock())
     first = store.create(scope(), FEED, is_owner=True)
     replay = store.create(scope(), "https://example.com/another.atom", is_owner=True)
     same_url = store.create(scope(event="event2"), FEED, is_owner=True)
-    assert first["id"] == replay["id"] == same_url["id"]
-    assert len(store.list(scope())) == 1
+    assert first["id"] != replay["id"]
+    assert first["id"] == same_url["id"]
+    assert len(store.list(scope())) == 2
 
 
 @pytest.mark.parametrize("interval", [0, 899, 86401])
@@ -104,35 +107,277 @@ def test_five_watch_limit_is_per_channel(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_commands_create_list_digest_remove_and_help(tmp_path):
+async def test_tools_create_list_digest_and_remove(tmp_path):
     clock = Clock()
     store = make_store(tmp_path, clock)
     service, fetch, send = make_service(store, clock, [feed("v1")])
-    assert await service.manage("hello", scope(), True) is None
-    assert await service.manage("watch", scope(), True) == HELP
-    assert "owner" in await service.manage(f"watch {FEED}", scope(sender="stranger"), True)
-    reply = await service.manage(f"watch {FEED} every 60m", scope(), True)
+    denied = await service.execute_tool("create_source_watch", {"url": FEED}, scope(sender="stranger"), True)
+    assert denied["status"] == "failure" and "owner" in denied["message"]
+    reply = await service.execute_tool("create_source_watch", {"url": FEED, "interval_minutes": 60}, scope(), True)
     watch = store.list(scope())[0]
-    assert watch["interval_seconds"] == 3600 and watch["id"] in reply
-    assert await service.manage(f"watch {FEED} every 60m", scope(), True) == reply
-    assert watch["id"] in await service.manage("watches", scope(event="list"), False)
-    assert "first check" in await service.manage("digest", scope(event="digest0"), False)
+    assert watch["interval_seconds"] == 3600 and reply["watch"]["watch_id"] == watch["id"]
+    assert reply["status"] == "success" and reply["created"] is True
+    assert await service.execute_tool("create_source_watch", {"url": FEED}, scope(), True) == reply
+    listed = await service.execute_tool("list_source_watches", {}, scope(event="list"))
+    assert listed["watches"][0]["watch_id"] == watch["id"]
+    waiting = await service.execute_tool("get_source_digest", {}, scope(event="digest0"))
+    assert "first check" in waiting["message"] and waiting["entries"] == []
     await service.tick()
-    digest = await service.manage(f"digest {watch['id']}", scope(event="digest1"), False)
-    assert "Release v1" in digest and "https://example.com/releases/v1" in digest
-    assert "Removed" in await service.manage(f"unwatch {watch['id']}", scope(event="remove"), True)
+    digest = await service.execute_tool("get_source_digest", {"watch_id": watch["id"]}, scope(event="digest1"))
+    assert "Release v1" in digest["message"] and "https://example.com/releases/v1" in digest["message"]
+    assert digest["entries"][0]["url"] == "https://example.com/releases/v1"
+    assert digest["trust"] == "untrusted_source"
+    removed = await service.execute_tool("remove_source_watch", {"watch_id": watch["id"]}, scope(event="remove"), True)
+    assert removed["status"] == "success" and removed["removed"] is True
     assert store.list(scope()) == []
     assert fetch.await_count == 1 and send.await_count == 0
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("suffix,expected", [("every 15m", 900), ("every 24h", 86400), ("", 3600)])
-async def test_command_intervals(tmp_path, suffix, expected):
+@pytest.mark.parametrize("minutes,expected", [(15, 900), (1440, 86400), (None, 3600)])
+async def test_tool_intervals(tmp_path, minutes, expected):
     clock = Clock()
     store = make_store(tmp_path, clock)
     service, _, _ = make_service(store, clock, [])
-    await service.manage(f"watch {FEED} {suffix}", SimpleNamespace(**scope()), True)
+    params = {"url": FEED}
+    if minutes is not None:
+        params["interval_minutes"] = minutes
+    result = await service.execute_tool("create_source_watch", params, SimpleNamespace(**scope()), True)
+    assert result["status"] == "success"
     assert store.list(scope())[0]["interval_seconds"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,params", [
+    ("create_source_watch", {}),
+    ("create_source_watch", {"url": FEED, "interval_minutes": True}),
+    ("create_source_watch", {"url": FEED, "interval_minutes": 60.0}),
+    ("create_source_watch", {"url": FEED, "interval_minutes": "60"}),
+    ("create_source_watch", {"url": FEED, "interval_minutes": 14}),
+    ("create_source_watch", {"url": FEED, "interval_minutes": 1441}),
+    ("create_source_watch", {"url": FEED, "channel_id": "21"}),
+    ("create_source_watch", {"url": FEED, "sender_id": "owner"}),
+    ("create_source_watch", {"url": FEED, "event_id": "other"}),
+    ("list_source_watches", {"channel_id": "21"}),
+    ("remove_source_watch", {}),
+    ("remove_source_watch", {"watch_id": "abcdef123456", "channel_type": "matrix"}),
+    ("get_source_digest", {"watch_id": None}),
+    ("get_source_digest", {"watch_id": "abcdef123456", "url": FEED}),
+    ("watch", {"url": FEED}),
+    ("create_source_watch", None),
+])
+async def test_tool_parameters_are_strict_and_scope_stays_trusted(tmp_path, name, params):
+    store = make_store(tmp_path, Clock())
+    result = await SourceWatchService(store).execute_tool(name, params, scope(), True)
+    assert result["status"] == "failure" and result["message"]
+    assert store.list(scope()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sender,flag", [("owner", False), ("stranger", True), ("stranger", False)])
+async def test_tool_writes_check_owner_before_saved_receipt(tmp_path, sender, flag):
+    store = make_store(tmp_path, Clock())
+    service = SourceWatchService(store)
+    created = await service.execute_tool("create_source_watch", {"url": FEED}, scope(), True)
+    replay = await service.execute_tool("create_source_watch", {"url": FEED}, scope(sender=sender), flag)
+    removed = await service.execute_tool("remove_source_watch", {"watch_id": created["watch"]["watch_id"]}, scope(sender=sender), flag)
+    assert replay["status"] == removed["status"] == "failure"
+    assert len(store.list(scope())) == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_reads_and_removal_stay_in_current_channel(tmp_path):
+    store = make_store(tmp_path, Clock())
+    service = SourceWatchService(store)
+    created = await service.execute_tool("create_source_watch", {"url": FEED}, scope(), True)
+    watch_id = created["watch"]["watch_id"]
+    other = await service.execute_tool("list_source_watches", {}, scope("21", sender="reader"))
+    digest = await service.execute_tool("get_source_digest", {"watch_id": watch_id}, scope("21"))
+    removed = await service.execute_tool("remove_source_watch", {"watch_id": watch_id}, scope("21"), True)
+    assert other["watches"] == []
+    assert digest["status"] == removed["status"] == "failure"
+    assert "this channel" in removed["message"] and removed["removed"] is False
+    for name, params in [("create_source_watch", {"url": FEED}), ("list_source_watches", {}),
+                         ("remove_source_watch", {"watch_id": watch_id}), ("get_source_digest", {})]:
+        result = await service.execute_tool(name, params, scope("private"), True)
+        assert result["status"] == "failure" and "configured channel" in result["message"]
+    assert len(store.list(scope())) == 1
+
+
+@pytest.mark.asyncio
+async def test_tools_use_platform_as_part_of_the_channel_scope(tmp_path):
+    store = WatchStore(tmp_path / "watches.db", owner_ids={"discord": {"owner"}, "matrix": {"owner"}},
+                       allowed_channels={"discord": {"20"}, "matrix": {"20"}})
+    service = SourceWatchService(store)
+    discord = await service.execute_tool("create_source_watch", {"url": FEED}, scope(), True)
+    matrix_scope = {**scope(), "channel_type": "matrix"}
+    matrix = await service.execute_tool("create_source_watch", {"url": FEED}, matrix_scope, True)
+    assert discord["watch"]["watch_id"] != matrix["watch"]["watch_id"]
+    removed = await service.execute_tool("remove_source_watch", {"watch_id": discord["watch"]["watch_id"]}, matrix_scope, True)
+    assert removed["status"] == "failure"
+    assert len(store.list(scope())) == len(store.list(matrix_scope)) == 1
+
+
+@pytest.mark.asyncio
+async def test_write_tools_require_a_human_event_and_reads_use_saved_state(tmp_path):
+    store = make_store(tmp_path, Clock())
+    watch = store.create(scope(), FEED, is_owner=True)
+    service = SourceWatchService(store)
+    for name, params in [("create_source_watch", {"url": FEED}), ("remove_source_watch", {"watch_id": watch["id"]})]:
+        result = await service.execute_tool(name, params, scope(event=""), True)
+        assert result["status"] == "failure" and "human request" in result["message"]
+    listed = await service.execute_tool("list_source_watches", {}, scope(event="", sender="reader"))
+    assert len(listed["watches"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_receipts_support_two_urls_in_one_event_and_canonical_replays(tmp_path):
+    store = make_store(tmp_path, Clock())
+    service = SourceWatchService(store)
+    first = await service.execute_tool("create_source_watch", {"url": FEED}, scope(), True)
+    replay = await service.execute_tool("create_source_watch", {"interval_minutes": 60, "url": FEED + "#part"}, scope(), True)
+    second = await service.execute_tool("create_source_watch", {"url": "https://example.com/another.atom"}, scope(), True)
+    duplicate = await service.execute_tool("create_source_watch", {"url": FEED}, scope(event="event2"), True)
+    assert replay == first and first["watch"]["watch_id"] != second["watch"]["watch_id"]
+    assert duplicate["watch"]["watch_id"] == first["watch"]["watch_id"] and duplicate["created"] is False
+    assert len(store.list(scope())) == 2
+    with store._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM source_watch_tool_receipts").fetchone()[0] == 3
+
+
+@pytest.mark.asyncio
+async def test_create_and_remove_replays_keep_original_results_after_restart(tmp_path):
+    clock = Clock()
+    store = make_store(tmp_path, clock)
+    service = SourceWatchService(store)
+    created = await service.execute_tool("create_source_watch", {"url": FEED}, scope(), True)
+    watch_id = created["watch"]["watch_id"]
+    removed = await service.execute_tool("remove_source_watch", {"watch_id": watch_id}, scope(event="remove"), True)
+    clock.advance()
+    restored = make_store(tmp_path, clock)
+    restarted = SourceWatchService(restored)
+    assert await restarted.execute_tool("create_source_watch", {"url": FEED}, scope(), True) == created
+    assert await restarted.execute_tool("remove_source_watch", {"watch_id": watch_id.upper()}, scope(event="remove"), True) == removed
+    assert restored.list(scope()) == []
+    fresh = await restarted.execute_tool("create_source_watch", {"url": FEED}, scope(event="new"), True)
+    assert fresh["created"] is True and fresh["watch"]["watch_id"] != watch_id
+
+
+@pytest.mark.asyncio
+async def test_missing_remove_result_is_saved_and_successful_remove_replays(tmp_path):
+    store = make_store(tmp_path, Clock())
+    service = SourceWatchService(store)
+    missing = await service.execute_tool("remove_source_watch", {"watch_id": "abcdef123456"}, scope(), True)
+    assert missing == {"status": "failure", "message": "Choose a source watch ID from this channel.",
+                       "watch_id": "abcdef123456", "removed": False}
+    assert await service.execute_tool("remove_source_watch", {"watch_id": "ABCDEF123456"}, scope(), True) == missing
+
+
+@pytest.mark.asyncio
+async def test_watch_limit_failure_replays_after_a_slot_becomes_free(tmp_path):
+    store = make_store(tmp_path, Clock())
+    for number in range(5):
+        store.create(scope(event=str(number)), f"https://example.com/{number}.atom", is_owner=True)
+    service = SourceWatchService(store)
+    failed = await service.execute_tool("create_source_watch", {"url": FEED}, scope(event="full"), True)
+    assert failed["status"] == "failure"
+    store.remove(scope(), store.list(scope())[0]["id"], is_owner=True)
+    assert await service.execute_tool("create_source_watch", {"url": FEED}, scope(event="full"), True) == failed
+    fresh = await service.execute_tool("create_source_watch", {"url": FEED}, scope(event="fresh"), True)
+    assert fresh["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_list_and_digest_reads_follow_saved_changes_in_the_same_event(tmp_path):
+    clock = Clock()
+    store = make_store(tmp_path, clock)
+    service, fetch, _ = make_service(store, clock, [feed("v1"), feed("v2", "v1")])
+    initial = await service.execute_tool("list_source_watches", {}, scope())
+    assert initial["watches"] == []
+    created = await service.execute_tool("create_source_watch", {"url": FEED}, scope(), True)
+    assert len((await service.execute_tool("list_source_watches", {}, scope()))["watches"]) == 1
+    before = await service.execute_tool("get_source_digest", {}, scope())
+    assert before["entries"] == []
+    await service.tick()
+    first = await service.execute_tool("get_source_digest", {}, scope())
+    clock.advance()
+    await service.tick()
+    changed = await service.execute_tool("get_source_digest", {}, scope())
+    assert first["entries"][0]["title"] == "Release v1"
+    assert changed["entries"][0]["title"] == "Release v2" and changed["entry_count"] == 2
+    await service.execute_tool("remove_source_watch", {"watch_id": created["watch"]["watch_id"]}, scope(), True)
+    assert (await service.execute_tool("list_source_watches", {}, scope()))["watches"] == []
+    with store._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM source_watch_tool_receipts").fetchone()[0] == 2
+    assert fetch.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_digest_entry_data_is_bounded_and_keeps_full_public_links(tmp_path):
+    clock = Clock()
+    store = make_store(tmp_path, clock)
+    store.create(scope(), FEED, is_owner=True)
+    entries = {"status": "success", "url": FEED, "items": [
+        {"title": "t" * 300, "summary": "s" * 600, "published": "p" * 200,
+         "url": f"https://example.com/{number}/" + "x" * 900} for number in range(10)]}
+    service, _, _ = make_service(store, clock, [entries])
+    await service.tick()
+    result = await service.execute_tool("get_source_digest", {}, scope())
+    assert result["entry_count"] == 10 and result["truncated"] is True and len(result["entries"]) == 5
+    assert len(result["message"]) < 1900
+    assert all(len(entry["title"]) <= 140 and len(entry["summary"]) <= 160 and len(entry["published"]) <= 100
+               for entry in result["entries"])
+    assert result["entries"][0]["url"] == entries["items"][0]["url"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "remove"])
+async def test_receipt_storage_failure_rolls_back_the_watch_mutation(tmp_path, operation):
+    store = make_store(tmp_path, Clock())
+    service = SourceWatchService(store)
+    if operation == "remove":
+        saved = store.create(scope(), FEED, is_owner=True)
+        params = {"watch_id": saved["id"]}
+    else:
+        params = {"url": FEED}
+    with patch.object(store, "_save_tool_receipt", side_effect=sqlite3.OperationalError("disk full")):
+        result = await service.execute_tool(f"{operation}_source_watch", params, scope(), True)
+    assert result["status"] == "failure"
+    assert len(store.list(scope())) == (1 if operation == "remove" else 0)
+    with store._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM source_watch_tool_receipts").fetchone()[0] == 0
+    retried = await service.execute_tool(f"{operation}_source_watch", params, scope(), True)
+    assert retried["status"] == "success"
+
+
+def test_concurrent_tool_calls_share_one_atomic_receipt(tmp_path):
+    clock = Clock()
+    stores = [make_store(tmp_path, clock), make_store(tmp_path, clock)]
+    def create(store):
+        return store.execute_mutation("create_source_watch", {"url": FEED}, scope(), True)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(create, stores))
+    assert results[0] == results[1] and results[0]["created"] is True
+    assert len(stores[0].list(scope())) == 1
+    with stores[0]._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM source_watch_tool_receipts").fetchone()[0] == 1
+
+
+def test_legacy_receipts_stay_saved_and_event_only_index_is_removed(tmp_path):
+    clock = Clock()
+    old = make_store(tmp_path, clock)
+    first = old.create(scope(), FEED, is_owner=True)
+    with old._db() as db:
+        db.execute("CREATE UNIQUE INDEX source_watch_request_event ON source_watches(channel_type,channel_id,request_event_id) WHERE request_event_id<>''")
+        db.execute("CREATE TABLE source_watch_commands (response TEXT)")
+        db.execute("INSERT INTO source_watch_commands VALUES ('saved legacy result')")
+    restored = make_store(tmp_path, clock)
+    second = restored.execute_mutation("create_source_watch", {"url": "https://example.com/another.atom"}, scope(), True)
+    assert second["status"] == "success" and len(restored.list(scope())) == 2
+    assert first["id"] in {watch["id"] for watch in restored.list(scope())}
+    with restored._db() as db:
+        assert db.execute("SELECT response FROM source_watch_commands").fetchone()[0] == "saved legacy result"
+        assert db.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='source_watch_request_event'").fetchone() is None
 
 
 @pytest.mark.asyncio
@@ -492,9 +737,12 @@ async def test_watch_list_preserves_every_id_with_long_public_urls(tmp_path):
     store = make_store(tmp_path, clock)
     watches = [store.create(scope(event=str(number)), f"https://example.com/{number}/" + "x" * 940,
                             is_owner=True) for number in range(5)]
-    text = await SourceWatchService(store).manage("watches", scope(event="list"), False)
-    assert all(watch["id"] in text for watch in watches)
-    assert len(text) < 1900 and "…" in text
+    result = await SourceWatchService(store).execute_tool("list_source_watches", {}, scope(event="list"))
+    assert {watch["watch_id"] for watch in result["watches"]} == {watch["id"] for watch in watches}
+    assert {watch["url"] for watch in result["watches"]} == {watch["url"] for watch in watches}
+    assert len(result["watches"]) == 5 and len(result["message"]) < 1900
+    assert all(set(watch) == {"watch_id", "url", "interval_minutes", "baseline", "fetched_at", "next_due", "delivery_status"}
+               for watch in result["watches"])
 
 
 @pytest.mark.asyncio
@@ -505,9 +753,11 @@ async def test_multi_watch_digest_keeps_complete_links_and_every_id(tmp_path):
     long_entry = {"status": "success", "url": FEED, "items": [{"title": "Release", "url": "https://example.com/" + "x" * 900}]}
     service, _, _ = make_service(store, clock, [long_entry] * 5)
     await service.tick()
-    text = await service.manage("digest", scope(event="digest"))
-    assert len(text) < 1900 and all(watch["id"] in text for watch in watches)
-    assert text.count("source links") == 5
+    result = await service.execute_tool("get_source_digest", {}, scope(event="digest"))
+    assert len(result["message"]) < 1900 and all(watch["id"] in result["message"] for watch in watches)
+    assert len(result["entries"]) == 5
+    assert all(entry["url"] == long_entry["items"][0]["url"] for entry in result["entries"])
+    assert result["truncated"] is False and result["entry_count"] == 5
 
 
 def test_redirected_feed_entries_with_feed_links_have_separate_keys():

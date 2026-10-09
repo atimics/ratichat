@@ -1,4 +1,4 @@
-"""Owner-managed public feed watches with saved updates and delivery receipts."""
+"""Source watch tools with saved updates, tool results, and delivery receipts."""
 
 import asyncio
 import hashlib
@@ -11,16 +11,6 @@ from datetime import datetime, timezone
 from contextlib import contextmanager
 
 from ...tools.web_tools import ReadFeedTool, page_text, public_url
-
-
-HELP = "Use `watch <public RSS/Atom URL> [every 1h|60m]`, `watches`, `unwatch <id>`, or `digest [id]`. Intervals range from 15 minutes to 24 hours."
-
-
-def watch_command(text):
-    """Read a command from the human's message before an AI step."""
-    text = re.sub(r"^\s*<@!?\d+>\s*", "", str(text or "")).strip()
-    verb = text.split(maxsplit=1)[0].lower() if text else ""
-    return text if verb in {"watch", "watches", "unwatch", "digest"} else None
 
 
 def _scope(value):
@@ -49,6 +39,47 @@ def _feed_url(value):
 def _safe_text(value, limit):
     text = page_text(str(value or ""))[:limit].replace("@", "＠")
     return re.sub(r"([\\`*_\[\]<>|])", r"\\\1", text)
+
+
+def _tool_params(tool_name, params):
+    fields = {
+        "create_source_watch": {"url", "interval_minutes"},
+        "list_source_watches": set(),
+        "remove_source_watch": {"watch_id"},
+        "get_source_digest": {"watch_id"},
+    }
+    if not isinstance(tool_name, str) or tool_name not in fields:
+        raise ValueError("Choose a source watch tool")
+    if not isinstance(params, dict):
+        raise ValueError("Provide the tool parameters as an object")
+    if set(params) - fields[tool_name]:
+        raise ValueError("Use only the parameters declared by this source watch tool")
+    if tool_name == "create_source_watch":
+        url = _feed_url(params.get("url"))
+        minutes = params.get("interval_minutes", 60)
+        if type(minutes) is not int or not 15 <= minutes <= 1440:
+            raise ValueError("Choose an interval from 15 minutes to 24 hours")
+        return {"url": url, "interval_minutes": minutes}
+    if "watch_id" in params or tool_name == "remove_source_watch":
+        watch_id = params.get("watch_id")
+        if not isinstance(watch_id, str) or not re.fullmatch(r"[a-f0-9]{12}", watch_id, re.IGNORECASE):
+            raise ValueError("Provide a source watch ID from this channel")
+        return {"watch_id": watch_id.lower()}
+    return {}
+
+
+def _public_watch(watch):
+    return {"watch_id": watch["id"], "url": watch["url"],
+            "interval_minutes": watch["interval_seconds"] // 60,
+            "baseline": bool(watch["baseline"]), "fetched_at": watch["fetched_at"],
+            "next_due": watch["next_due"], "delivery_status": watch["pending_status"] or "idle"}
+
+
+def _public_entry(watch, item):
+    return {"watch_id": watch["id"], "title": str(item.get("title") or "")[:140],
+            "url": _feed_url(item.get("url") or watch["url"]),
+            "published": str(item.get("published") or "")[:100],
+            "summary": str(item.get("summary") or "")[:160]}
 
 
 def _items(result, feed_url):
@@ -120,8 +151,7 @@ class WatchStore:
                     reconcile_after REAL NOT NULL DEFAULT 0, reconcile_attempts INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(channel_type, channel_id, url)
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS source_watch_request_event
-                    ON source_watches(channel_type,channel_id,request_event_id) WHERE request_event_id<>'';
+                DROP INDEX IF EXISTS source_watch_request_event;
                 CREATE TABLE IF NOT EXISTS source_watch_items (
                     watch_id TEXT NOT NULL, item_key TEXT NOT NULL,
                     PRIMARY KEY(watch_id, item_key),
@@ -136,9 +166,11 @@ class WatchStore:
                     day TEXT NOT NULL, channel_type TEXT NOT NULL, channel_id TEXT NOT NULL,
                     lookups INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day,channel_type,channel_id)
                 );
-                CREATE TABLE IF NOT EXISTS source_watch_commands (
+                CREATE TABLE IF NOT EXISTS source_watch_tool_receipts (
                     channel_type TEXT NOT NULL, channel_id TEXT NOT NULL, event_id TEXT NOT NULL,
-                    response TEXT NOT NULL, PRIMARY KEY(channel_type, channel_id, event_id)
+                    tool_name TEXT NOT NULL, params_hash TEXT NOT NULL, sender_id TEXT NOT NULL,
+                    result_json TEXT NOT NULL, created_at REAL NOT NULL,
+                    PRIMARY KEY(channel_type, channel_id, event_id, tool_name, params_hash)
                 );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(source_watches)")}
@@ -174,19 +206,56 @@ class WatchStore:
             raise ValueError("Choose an interval from 15 minutes to 24 hours")
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            existing = db.execute("SELECT * FROM source_watches WHERE channel_type=? AND channel_id=? AND (url=? OR (request_event_id<>'' AND request_event_id=?))",
-                                  (scope["channel_type"], scope["channel_id"], url, scope["event_id"])).fetchone()
-            if existing:
-                return dict(existing)
-            count = db.execute("SELECT COUNT(*) FROM source_watches WHERE channel_type=? AND channel_id=?",
-                               (scope["channel_type"], scope["channel_id"])).fetchone()[0]
-            if count >= 5:
-                raise ValueError("This channel has five watches. Remove a watch to add another")
-            watch_id = uuid.uuid4().hex[:12]
-            now = self.now()
-            db.execute("INSERT INTO source_watches (id,channel_type,channel_id,owner_id,request_event_id,url,interval_seconds,created_at,next_due) VALUES (?,?,?,?,?,?,?,?,?)",
-                       (watch_id, scope["channel_type"], scope["channel_id"], scope["sender_id"], scope["event_id"], url, interval_seconds, now, now))
-            return dict(db.execute("SELECT * FROM source_watches WHERE id=?", (watch_id,)).fetchone())
+            watch, _ = self._create(db, scope, url, interval_seconds)
+            return watch
+
+    def _create(self, db, scope, url, interval_seconds):
+        existing = db.execute("SELECT * FROM source_watches WHERE channel_type=? AND channel_id=? AND url=?",
+                              (scope["channel_type"], scope["channel_id"], url)).fetchone()
+        if existing:
+            return dict(existing), False
+        count = db.execute("SELECT COUNT(*) FROM source_watches WHERE channel_type=? AND channel_id=?",
+                           (scope["channel_type"], scope["channel_id"])).fetchone()[0]
+        if count >= 5:
+            raise ValueError("This channel has five watches. Remove a saved watch before adding another")
+        watch_id = uuid.uuid4().hex[:12]
+        now = self.now()
+        db.execute("INSERT INTO source_watches (id,channel_type,channel_id,owner_id,request_event_id,url,interval_seconds,created_at,next_due) VALUES (?,?,?,?,?,?,?,?,?)",
+                   (watch_id, scope["channel_type"], scope["channel_id"], scope["sender_id"], scope["event_id"], url, interval_seconds, now, now))
+        return dict(db.execute("SELECT * FROM source_watches WHERE id=?", (watch_id,)).fetchone()), True
+
+    def execute_mutation(self, tool_name, params, scope, is_owner=False):
+        scope = self._check_scope(scope, is_owner, write=True)
+        params = _tool_params(tool_name, params)
+        if tool_name not in {"create_source_watch", "remove_source_watch"}:
+            raise ValueError("Choose a source watch write tool")
+        if not scope["event_id"]:
+            raise ValueError("A current human request is required")
+        params_hash = hashlib.sha256(json.dumps(params, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+        key = (scope["channel_type"], scope["channel_id"], scope["event_id"], tool_name, params_hash)
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute("SELECT result_json FROM source_watch_tool_receipts WHERE channel_type=? AND channel_id=? AND event_id=? AND tool_name=? AND params_hash=?", key).fetchone()
+            if prior:
+                return json.loads(prior[0])
+            try:
+                if tool_name == "create_source_watch":
+                    watch, created = self._create(db, scope, params["url"], params["interval_minutes"] * 60)
+                    result = {"status": "success", "message": "The feed watch is saved. Its first check saves a quiet baseline." if created else "The feed watch is already saved.",
+                              "watch": _public_watch(watch), "created": created}
+                else:
+                    removed = db.execute("DELETE FROM source_watches WHERE id=? AND channel_type=? AND channel_id=?",
+                                         (params["watch_id"], scope["channel_type"], scope["channel_id"])).rowcount == 1
+                    result = {"status": "success" if removed else "failure", "message": "The feed watch was removed." if removed else "Choose a source watch ID from this channel.",
+                              "watch_id": params["watch_id"], "removed": removed}
+            except ValueError as error:
+                result = {"status": "failure", "message": str(error)}
+            self._save_tool_receipt(db, key, scope["sender_id"], result)
+            return result
+
+    def _save_tool_receipt(self, db, key, sender_id, result):
+        db.execute("INSERT INTO source_watch_tool_receipts VALUES (?,?,?,?,?,?,?,?)",
+                   (*key, sender_id, json.dumps(result, ensure_ascii=False), self.now()))
 
     def list(self, scope):
         scope = self._check_scope(scope)
@@ -199,22 +268,6 @@ class WatchStore:
         with self._db() as db:
             return db.execute("DELETE FROM source_watches WHERE id=? AND channel_type=? AND channel_id=?",
                               (watch_id, scope["channel_type"], scope["channel_id"])).rowcount == 1
-
-    def command_response(self, scope):
-        scope = _scope(scope)
-        if not scope["event_id"]:
-            return None
-        with self._db() as db:
-            row = db.execute("SELECT response FROM source_watch_commands WHERE channel_type=? AND channel_id=? AND event_id=?",
-                             (scope["channel_type"], scope["channel_id"], scope["event_id"])).fetchone()
-            return row[0] if row else None
-
-    def save_command_response(self, scope, text):
-        scope = _scope(scope)
-        if scope["event_id"]:
-            with self._db() as db:
-                db.execute("INSERT OR IGNORE INTO source_watch_commands VALUES (?,?,?,?)",
-                           (scope["channel_type"], scope["channel_id"], scope["event_id"], text))
 
     def claim(self, pending=False, lease_seconds=180):
         now = self.now()
@@ -352,63 +405,41 @@ class SourceWatchService:
     async def _fetch(self, url):
         return await ReadFeedTool().execute({"url": url}, self.action_context)
 
-    async def manage(self, command, scope, is_owner=False):
-        text = str(command or "").strip()
-        verb = text.split(maxsplit=1)[0].lower() if text else ""
-        if verb not in {"watch", "watches", "unwatch", "digest"}:
-            return None
+    async def execute_tool(self, tool_name, params, scope, is_owner=False):
         try:
-            self.store._check_scope(scope, is_owner, write=verb in {"watch", "unwatch"})
-            prior = self.store.command_response(scope)
-            if prior:
-                return prior
-            if verb == "watch":
-                match = re.fullmatch(r"watch\s+(\S+)(?:\s+every\s+(\d+)([mh]))?", text, re.IGNORECASE)
-                if not match:
-                    return HELP
-                interval = int(match[2]) * (3600 if match[3].lower() == "h" else 60) if match[2] else 3600
-                watch = self.store.create(scope, match[1], interval, is_owner)
-                response = f"Watch {watch['id']} is set for every {watch['interval_seconds'] // 60} minutes. The first check saves a quiet baseline.\n{watch['url']}"
-            elif verb == "unwatch":
-                match = re.fullmatch(r"unwatch\s+([a-f0-9]{12})", text, re.IGNORECASE)
-                if not match:
-                    return HELP
-                response = f"Removed watch {match[1]}." if self.store.remove(scope, match[1].lower(), is_owner) else "Choose an ID from this channel's `watches` list."
-            else:
-                match = re.fullmatch(r"watches" if verb == "watches" else r"digest(?:\s+([a-f0-9]{12}))?", text, re.IGNORECASE)
-                if not match:
-                    return HELP
-                watches = self.store.list(scope)
-                if verb == "watches":
-                    lines = []
-                    for watch in watches:
-                        url = watch["url"].replace("`", "%60")
-                        preview = url[:260] + ("…" if len(url) > 260 else "")
-                        lines.append(f"{watch['id']} · every {watch['interval_seconds'] // 60}m · `{preview}`")
-                    response = "\n".join(lines) or "This channel has zero watches. " + HELP
+            params = _tool_params(tool_name, params)
+            if tool_name in {"create_source_watch", "remove_source_watch"}:
+                return self.store.execute_mutation(tool_name, params, scope, is_owner)
+            watches = self.store.list(scope)
+            if tool_name == "list_source_watches":
+                return {"status": "success", "message": f"This channel has {len(watches)} saved feed watches.",
+                        "watches": [_public_watch(watch) for watch in watches]}
+            requested = params.get("watch_id")
+            selected = [watch for watch in watches if requested is None or watch["id"] == requested]
+            if requested and not selected:
+                return {"status": "failure", "message": "Choose a source watch ID from this channel."}
+            entries, entry_count, lines = [], 0, []
+            for watch in selected:
+                items = json.loads(watch["last_items"])[:10]
+                entry_count += len(items)
+                if not items:
+                    lines.append(f"Feed {watch['id']} is waiting for its first check.")
+                    continue
+                count = 1 if len(selected) > 1 else 5
+                entries.extend(_public_entry(watch, item) for item in items[:count])
+                if len(selected) == 1:
+                    lines.append(_digest(watch, items, latest=True))
                 else:
-                    requested = match[1].lower() if match[1] else None
-                    selected = [watch for watch in watches if requested is None or watch["id"] == requested]
-                    if len(selected) > 1:
-                        lines = []
-                        for watch in selected:
-                            items = json.loads(watch["last_items"])
-                            if not items:
-                                lines.append(f"Watch {watch['id']} is waiting for its first check.")
-                                continue
-                            item = items[0]
-                            title = _safe_text(item["title"], 90)
-                            line = f"Watch {watch['id']} · [{title}]({_link_url(item['url'])})"
-                            if len(line) > 350:
-                                line = f"Watch {watch['id']} · {title}. Read `digest {watch['id']}` for its source links."
-                            lines.append(line)
-                        response = "Latest cached entries:\n" + "\n".join(lines)
-                    else:
-                        response = "\n\n".join(watch["last_digest"] or f"Watch {watch['id']} is waiting for its first check." for watch in selected) or "Choose an ID from this channel's `watches` list."
-            self.store.save_command_response(scope, response)
-            return response
+                    title = _safe_text(items[0]["title"], 90)
+                    line = f"Feed {watch['id']} · [{title}]({_link_url(items[0]['url'])})"
+                    lines.append(line if len(line) <= 350 else f"Feed {watch['id']} · {title}")
+            return {"status": "success", "message": "\n".join(lines) or "This channel has zero saved feed watches.",
+                    "watches": [_public_watch(watch) for watch in selected], "entries": entries,
+                    "entry_count": entry_count, "truncated": entry_count > len(entries), "trust": "untrusted_source"}
         except (ValueError, TypeError) as error:
-            return str(error)
+            return {"status": "failure", "message": str(error)}
+        except sqlite3.Error:
+            return {"status": "failure", "message": "Source watch storage needs another attempt."}
 
     async def _deliver(self, watch):
         if self.send is None:
