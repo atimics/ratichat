@@ -42,7 +42,7 @@ class ListPublicSourcesTool(ToolInterface):
             return {"status": "success", "news": NEWS_SOURCES,
                     "social_search": {name: {"domains": domains, "access": "public_search_index"} for name, domains in SOCIAL_DOMAINS.items()},
                     "bluesky_feed": {"tool": "read_bluesky_feed", "access": "public_api"},
-                    "message": "Public feeds provide news. Social search reads indexed public posts. Bluesky author feeds use its public API."}
+                    "message": "Public feeds provide news. Social search reads indexed public pages and posts. Bluesky author feeds use its public API."}
         except ValueError as error:
             return {"status": "failure", "error": str(error)}
 
@@ -68,7 +68,7 @@ class ReadNewsTool(ToolInterface):
 
 class SearchSocialTool(ToolInterface):
     name = "search_social"
-    description = "Find indexed public Reddit, Farcaster, X, or Bluesky posts about a focused topic. This uses public web search. Describe the result as indexed public posts and cite the returned links."
+    description = "Find indexed public Reddit, Farcaster, X, or Bluesky pages and posts about a focused topic. This uses public web search. Describe the result as indexed public results and cite the returned links."
     parameters_schema = {"platform": "string - reddit, farcaster, x, or bluesky",
                          "query": "string - Public topic to search, up to 350 characters",
                          "fresh": "boolean - Fetch again instead of using a fresh saved result"}

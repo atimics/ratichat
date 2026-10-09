@@ -22,9 +22,10 @@ at most 12,000 text characters. Feeds return up to ten entries.
 | `read_feed` | RSS and Atom news, blogs, GitHub releases | Public feed URL |
 
 Web search uses the owner's linked OpenRouter credits. It uses OpenRouter's
-`openrouter:web_search` server tool with Exa. `WEB_SEARCH_MODEL` chooses the
-search model. The default is `openai/gpt-4o-mini`. See the
-[OpenRouter search docs](https://openrouter.ai/docs/guides/features/server-tools/web-search).
+`web` plugin to fetch results once for each search. General searches use Exa.
+Social searches use Parallel with a filter for the chosen site's domains.
+`WEB_SEARCH_MODEL` chooses the search model. The default is `openai/gpt-4o-mini`.
+See the [OpenRouter search docs](https://openrouter.ai/docs/guides/features/plugins/web-search).
 
 Pages and feeds are fetched on request. For a GitHub release feed, use
 `https://github.com/OWNER/REPO/releases.atom`. For source files, use the public
@@ -48,7 +49,7 @@ The agent has `list_public_sources`, `read_news`, `search_social`, and
 `read_bluesky_feed`. News readers cover BBC News, BBC Technology, Hacker News,
 and CoinDesk. Each story has a source link and publisher credit. Bluesky author
 feeds use its public API. Reddit, X, Farcaster, and Bluesky search uses indexed
-public posts through the linked web search account. Results include the access
+public pages and posts through the linked web search account. Results include the access
 type and source links, so the agent can describe their coverage clearly.
 
 Ask in plain English, such as “What is happening in world news?”, “Find Reddit

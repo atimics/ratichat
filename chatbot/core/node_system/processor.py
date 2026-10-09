@@ -252,7 +252,7 @@ class NodeProcessor:
             "sources.pages": {"description": "Read public pages, project docs, or raw GitHub files with read_webpage."},
             "sources.feeds": {"description": "Read news, blogs, or GitHub release RSS/Atom feeds with read_feed."},
             "sources.news": {"description": "Use read_news for BBC News, BBC Technology, Hacker News, and CoinDesk headlines."},
-            "sources.social": {"description": "Use search_social for indexed public Reddit, Farcaster, X, or Bluesky posts. Use read_bluesky_feed for a public author feed."},
+            "sources.social": {"description": "Use search_social for indexed public Reddit, Farcaster, X, or Bluesky pages and posts. Use read_bluesky_feed for a public author feed."},
         }
         if turn:
             sources["channel.memory"] = self.research_store.memory_node(channel.type, channel.id)
