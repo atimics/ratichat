@@ -23,6 +23,14 @@ Ask for two or three views of a topic to use worker personas such as researcher,
 
 Proactive posts use the same saved awareness and model routes. Their existing topic, daytime, spacing, and daily limits still apply.
 
+## Conversation participation
+
+Human, bot, and webhook messages in approved Discord channels enter shared awareness. Text inside Discord embeds is included. Jev chooses whether to join or keep observing a conversation. Mentions are one context signal. Matrix conversations use the same choice.
+
+`CONVERSATION_PARTICIPATION_ENABLED=true` enables this behavior. A join choice starts the saved task and model route. A wait choice saves the observation and decision. Choices and reply receipts survive a restart. Reply chains use a shared thread identity.
+
+Conversation replies have a 30-second gap, a limit of three contributions to a thread or topic in ten minutes, and a channel limit of twelve replies per hour. Jev participation choices have a channel limit of sixty calls per hour. Each uncertain decision reserves $0.001. These limits apply to every conversation member. RatiChat's own delivered replies enter shared context through their saved receipts.
+
 ## Validation
 
 The suite covers cross-platform continuation after a SQLite reopen, separate views, approved audiences, source edits and deletions, account proofs, child budgets, worker replay, local model choices during parallel calls, typed Jev decisions, provider failures, and proactive shared context.

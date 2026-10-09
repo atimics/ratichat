@@ -1,4 +1,4 @@
-"""Receive bot mentions and send replies in configured Discord channels."""
+"""Observe configured Discord conversations and deliver selected replies."""
 
 import asyncio
 import hashlib
@@ -25,6 +25,7 @@ class DiscordObserver(Integration):
         self.awareness_store = None
         self.intake_started_at = time.time()
         self.message_content_enabled = getattr(config, "DISCORD_MESSAGE_CONTENT_ENABLED", False)
+        self.participation_enabled = getattr(config, "CONVERSATION_PARTICIPATION_ENABLED", True)
         self.token = config.DISCORD_BOT_TOKEN
         self.allowed_guild_ids = parse_id_allowlist(config.DISCORD_ALLOWED_GUILD_IDS)
         self.allowed_channel_ids = parse_id_allowlist(config.DISCORD_ALLOWED_CHANNEL_IDS)
@@ -154,6 +155,16 @@ class DiscordObserver(Integration):
     def _configured_source(self, guild_id, channel_id):
         return str(guild_id) in self.allowed_guild_ids and str(channel_id) in self.allowed_channel_ids
 
+    @staticmethod
+    def _content(text, embeds=()):
+        parts = [text.strip()]
+        for embed in list(embeds)[:3]:
+            data = embed if isinstance(embed, dict) else embed.to_dict()
+            parts.extend(str(data.get(key, ""))[:1500] for key in ("title", "description", "url"))
+            for field in data.get("fields", [])[:6]:
+                parts.append(str(field.get("name", ""))[:150] + ": " + str(field.get("value", ""))[:500])
+        return "\n".join(part for part in parts if part).strip()[:4000]
+
     def _record_message(self, message, content, guild_id, channel_id, mentioned):
         reference = getattr(message, "reference", None)
         timestamp = message.created_at.timestamp()
@@ -163,6 +174,10 @@ class DiscordObserver(Integration):
             sender_username=message.author.name, content=content, timestamp=timestamp,
             reply_to=str(reference.message_id) if reference and reference.message_id else None,
             metadata={"guild_id": guild_id, "bot_mentioned": mentioned,
+                      "is_bot": bool(message.author.bot or message.webhook_id), "is_self": False,
+                      "webhook_id": str(message.webhook_id) if message.webhook_id else None,
+                      "conversation_candidate": self.participation_enabled,
+                      "request_content": content,
                       "raw_content": message.content[:4000],
                       "historical": bool(getattr(message, "historical", False) or timestamp < self.intake_started_at)},
         )
@@ -178,15 +193,15 @@ class DiscordObserver(Integration):
         if not self._configured_source(payload.guild_id, payload.channel_id):
             return
         data = payload.data
-        if not isinstance(data, dict) or not isinstance(data.get("content"), str):
+        if not isinstance(data, dict) or (not isinstance(data.get("content"), str) and "embeds" not in data):
             return
         author = data.get("author")
-        message = getattr(payload, "message", None)
+        message = getattr(payload, "message", None) or getattr(payload, "cached_message", None)
         if not isinstance(author, dict) or not author.get("id"):
             if not message or not getattr(message, "author", None):
                 return
             author = {"id": str(message.author.id), "bot": message.author.bot}
-        if author.get("bot") or data.get("webhook_id"):
+        if self.client and self.client.user and str(author["id"]) == str(self.client.user.id):
             return
         original = getattr(payload, "cached_message", None)
         if original and str(original.author.id) != str(author["id"]):
@@ -209,16 +224,19 @@ class DiscordObserver(Integration):
             revision = stamp.timestamp()
         if self.awareness_store:
             try:
+                raw_content = data.get("content", getattr(message, "content", ""))
+                content = self._content(raw_content, data.get("embeds", getattr(message, "embeds", [])))
                 result = self.awareness_store.edit_message("discord", str(payload.channel_id), str(payload.message_id),
-                    {"sender": str(author["id"]), "content": data["content"][:4000],
-                     "source_revision": revision, "metadata": {"edited_at": revision, "raw_content": data["content"][:4000]}})
+                    {"sender": str(author["id"]), "content": content,
+                     "source_revision": revision, "metadata": {"edited_at": revision, "raw_content": raw_content[:4000],
+                                                               "request_content": content}})
                 if result.get("changed"):
                     self._requests.pop(str(payload.message_id), None)
                     if saved_channel:
                         for item in saved_channel.recent_messages:
                             if item.id == str(payload.message_id):
-                                item.content = data["content"][:4000]
-                                item.metadata.update(edited_at=revision, raw_content=item.content)
+                                item.content = content
+                                item.metadata.update(edited_at=revision, raw_content=raw_content[:4000], request_content=content)
             except Exception:
                 logger.warning("Discord message edit needs another save attempt")
 
@@ -249,9 +267,11 @@ class DiscordObserver(Integration):
         channel_id, guild_id = str(message.channel.id), str(message.guild.id)
         if not self._configured_source(guild_id, channel_id):
             return
-        if message.author.bot or message.webhook_id:
+        if message.author.id == self.client.user.id:
             return
-        content = message.content.strip()
+        if not self.participation_enabled and (message.author.bot or message.webhook_id):
+            return
+        content = self._content(message.content, getattr(message, "embeds", []))
         message_id = str(message.id)
         mentioned = any(user.id == self.client.user.id for user in message.mentions)
         record = self._record_message(message, content[:4000], guild_id, channel_id, mentioned)
@@ -259,13 +279,13 @@ class DiscordObserver(Integration):
             saved = self._save_observation(record)
             if isinstance(saved, dict) and saved.get("deleted"):
                 return
-        if not mentioned or record.metadata["historical"]:
+        if (not mentioned and not self.participation_enabled) or record.metadata["historical"]:
             return
-        if not content or len(content) > self.max_message_chars or message_id in self._requests:
+        if not content or len(message.content) > self.max_message_chars or message_id in self._requests:
             return
         if not self._rate_limiter.allow(f"{channel_id}:{message.author.id}"):
             return
-        self._requests[message_id] = (channel_id, str(message.author.id), message.content)
+        self._requests[message_id] = (channel_id, str(message.author.id), content)
         while len(self._requests) > 1000:
             self._requests.popitem(last=False)
         if not self.world_state.get_channel(channel_id):
@@ -275,12 +295,13 @@ class DiscordObserver(Integration):
             self.on_state_change()
 
     def restore_request(self, channel_id, source):
-        """Restore an accepted mention from its saved intake record."""
+        """Restore an observed conversation event from its saved intake record."""
         if (channel_id in self.allowed_channel_ids
                 and source.get("metadata", {}).get("guild_id") in self.allowed_guild_ids
-                and source.get("metadata", {}).get("bot_mentioned")):
-            raw = source["metadata"].get("raw_content", source["content"])
-            self._requests[source["id"]] = (channel_id, source["sender"], raw)
+                and (source.get("metadata", {}).get("bot_mentioned")
+                     or source.get("metadata", {}).get("conversation_candidate"))):
+            content = source["metadata"].get("request_content", source["metadata"].get("raw_content", source["content"]))
+            self._requests[source["id"]] = (channel_id, source["sender"], content)
 
     async def reconcile_reply(self, channel_id, reply_to_id, content):
         """Find the actual bot reply after a send lost its response."""
@@ -360,7 +381,7 @@ class DiscordObserver(Integration):
             if reply_to_id in self._replies:
                 return {"status": "success", "duplicate": True, "message_id": self._replies[reply_to_id]}
             if channel_id not in self.allowed_channel_ids or not self.can_reply(channel_id, reply_to_id):
-                return {"status": "failure", "retryable": False, "error": "Choose an accepted Discord mention in this channel"}
+                return {"status": "failure", "retryable": False, "error": "Choose an observed Discord message in this channel"}
             try:
                 channel = self.client.get_channel(int(channel_id))
                 if channel is None or str(channel.guild.id) not in self.allowed_guild_ids:
@@ -372,8 +393,9 @@ class DiscordObserver(Integration):
                 except Exception:
                     return {"status": "failure", "retryable": True, "error": "The source message needs another fetch"}
                 request = self._requests[reply_to_id]
-                if (str(source.author.id), source.content) != request[1:] or source.author.bot:
-                    return {"status": "failure", "retryable": False, "error": "The source message changed; send a fresh mention"}
+                current_content = self._content(source.content, getattr(source, "embeds", []))
+                if (str(source.author.id), current_content) != request[1:] or source.author.id == self.client.user.id:
+                    return {"status": "failure", "retryable": False, "error": "Use the current source message"}
                 content = content.strip()
                 if len(content) > 2000:
                     content = content[:1999] + "…"

@@ -15,6 +15,7 @@ from ..orchestration.capability_policy import READ_ONLY_SOURCE_TOOLS, SOURCE_WAT
 from .interaction_tools import NodeInteractionTools
 from .node_manager import NodeManager
 from .research_store import ResearchStore
+from .participation import own_message
 from ..world_state.structures import Channel, Message
 
 logger = logging.getLogger(__name__)
@@ -25,14 +26,14 @@ STATE_RESULT_PREFIXES = ("sources.watch_result_", "sources.proactive_result_", "
 
 
 def capture_request(world_state, policy, store, channel_id, message, *, accepted=False):
-    """Save one accepted human request with its channel context."""
+    """Save one observed conversation event with its channel context."""
     channel = world_state.get_channel(channel_id)
-    if not channel or message.metadata.get("is_bot") or message.metadata.get("historical"):
+    if not channel or own_message(message) or message.metadata.get("historical"):
         return
     if channel.type == "discord":
         if channel_id not in policy.approved_discord_channel_ids:
             return
-        if not accepted and not message.metadata.get("bot_mentioned"):
+        if not accepted and not message.metadata.get("bot_mentioned") and not message.metadata.get("conversation_candidate"):
             return
     elif channel.type == "matrix":
         if channel_id not in policy.approved_matrix_room_ids or message.sender == settings.MATRIX_USER_ID:
@@ -51,7 +52,7 @@ class NodeProcessor:
     MAX_STEPS = 5
     MAX_LOOKUPS = 3
 
-    def __init__(self, world_state, payload_builder, executor, db_path, research_store=None, awareness_store=None, task_service=None):
+    def __init__(self, world_state, payload_builder, executor, db_path, research_store=None, awareness_store=None, task_service=None, participation_service=None):
         self.world_state = world_state
         self.payload_builder = payload_builder
         self.executor = executor
@@ -69,8 +70,10 @@ class NodeProcessor:
         self.watch_service = None
         self.awareness_store = awareness_store
         self.task_service = task_service
+        self.participation_service = participation_service
         self._cycle_lock = asyncio.Lock()
         self._binding = None
+        self._participation = None
         self._view = None
         if db_path != ":memory:":
             with sqlite3.connect(db_path) as db:
@@ -184,6 +187,10 @@ class NodeProcessor:
             self.research_store.fail(turn["id"], turn["delivery_token"], "Use the current message version",
                                      phase="delivery", retryable=False)
             return {"status": "blocked", "message": "Use the current message version."}
+        if self.participation_service and not self.participation_service.can_deliver(channel.type, channel.id, turn["event_id"]):
+            self.research_store.fail(turn["id"], turn["delivery_token"], "The conversation has enough replies for now",
+                                     phase="delivery", retryable=False)
+            return {"status": "blocked", "message": "Keep observing this conversation."}
         payload = self.payload_builder.build_request_node_payload(channel, self.node_manager)
         scope = self.policy.scope_from_payload(payload)
         name = {"discord": "send_discord_reply", "matrix": "send_matrix_reply"}[channel.type]
@@ -216,6 +223,9 @@ class NodeProcessor:
         return result
 
     def _confirmed_reply(self, turn, receipt):
+        if self.participation_service:
+            self.participation_service.sent(turn["platform"], turn["channel_id"], turn["event_id"],
+                                            receipt.get("message_id") or receipt.get("event_id"))
         if not self.awareness_store:
             return
         task = self.awareness_store.get_task_for_event(turn["platform"], turn["channel_id"], turn["event_id"])
@@ -248,13 +258,24 @@ class NodeProcessor:
 
     async def _run_cycle(self, cycle_id, primary_channel_id, context=None, channel=None, turn=None):
         channel = channel or self.world_state.get_channel(primary_channel_id)
-        self._binding, self._view = None, None
+        self._binding, self._view, self._participation = None, None, None
         approved = channel and (channel.type == "discord" and channel.id in self.policy.approved_discord_channel_ids
             or channel.type == "matrix" and channel.id in self.policy.approved_matrix_room_ids)
+        if approved and channel.recent_messages:
+            source = channel.recent_messages[-1]
+            if own_message(source):
+                return self._result(0, 0, 0)
+            if self.participation_service and source.metadata.get("conversation_candidate"):
+                decision = await self.participation_service.evaluate(channel, source)
+                self._participation = {k: decision[k] for k in ("join", "topic", "reason")}
+                if not decision["join"]:
+                    if turn:
+                        self.research_store.finish_without_reply(turn["id"], turn["lease_token"])
+                    return {**self._result(0, 0, 0), "participation": decision}
         if not self.task_service or not approved or not channel.recent_messages:
             return await self._run_cycle_inner(cycle_id, primary_channel_id, context, channel, turn)
         source = channel.recent_messages[-1]
-        if source.metadata.get("is_bot") or not self.ai_engine.api_key:
+        if own_message(source) or not self.ai_engine.api_key:
             return self._result(0, 0, 0)
         for message in channel.recent_messages:
             # Intake already holds the latest version. Replaying a saved request
@@ -303,7 +324,7 @@ class NodeProcessor:
         channel = replace(channel, recent_messages=list(channel.recent_messages))
         source = channel.recent_messages[-1]
         observer = getattr(self.executor.action_context, f"{channel.type}_observer", None)
-        if source.metadata.get("is_bot"):
+        if own_message(source):
             return {"actions_executed": 0}
         if channel.type == "discord":
             if channel.id not in self.policy.approved_discord_channel_ids or not observer or not observer.can_reply(channel.id, source.id):
@@ -393,6 +414,8 @@ class NodeProcessor:
                 final_step = force_answer or step == self.MAX_STEPS - 1 or lookups >= self.MAX_LOOKUPS
                 names = allowed - READ_ONLY_SOURCE_TOOLS - TASK_TOOLS if final_step else allowed
                 payload = self.payload_builder.build_request_node_payload(channel, self.node_manager, sources)
+                if self._participation:
+                    payload["participation"] = self._participation
                 self.catalog = {channel_path: {}, **sources}
                 if self._binding:
                     payload["task_route"] = self._binding.route
