@@ -510,7 +510,7 @@ class NodeProcessor:
                                 self._binding.nodes[node_id] = {k: v for k, v in shared_source.items() if k != "node_id"}
                                 self._binding.fresh_nodes.add(node_id)
                                 self._binding.input_versions = self.awareness_store.snapshot_versions(
-                                    channel.type, channel.id, source.sender, {k: v for k, v in self._binding.nodes.items() if v["kind"] != "task"})
+                                    channel.type, channel.id, source.sender, {k: v for k, v in self._binding.nodes.items() if v["kind"] != "task"}, event_id=source.id)
                                 self.awareness_store.save_route(self._binding.task["id"], self._binding.route,
                                     input_versions=self._binding.input_versions)
                             if turn and result.get("status") == "success":

@@ -49,6 +49,8 @@ class TaskService:
 
     async def prepare(self, channel, source, *, proactive=False):
         nodes = self.store.catalog(channel.type, channel.id, source.sender, query=source.content)
+        inputs = self.store.snapshot_versions(channel.type, channel.id, source.sender,
+            {k: v for k, v in nodes.items() if v["kind"] != "task"}, event_id=None if proactive else source.id)
         task = self.store.task_for_request(channel.type, channel.id, source.sender, source.id,
             goal=source.content[:2000], budget_usd=self.budget_usd)
         route = task.get("route")
@@ -60,9 +62,11 @@ class TaskService:
             if resume and resume != task["id"]:
                 task = self.store.continue_task(resume, channel.type, channel.id, source.sender, source.id, replace_task_id=task["id"])
                 route = task.get("route") or route
-            self.store.save_route(task["id"], route, input_versions=self.store.snapshot_versions(channel.type, channel.id, source.sender, {k: v for k, v in nodes.items() if v["kind"] != "task"}))
+        saved = self.store.save_route(task["id"], route, input_versions=inputs)
+        if not saved.get("saved"):
+            raise ValueError("Use a fresh task source snapshot.")
         return TaskBinding(self, task, channel.type, channel.id, source.sender, source.id,
-            copy.deepcopy(nodes), route, input_versions=self.store.snapshot_versions(channel.type, channel.id, source.sender, {k: v for k, v in nodes.items() if v["kind"] != "task"}), request_text=source.content)
+            copy.deepcopy(nodes), route, input_versions=inputs, request_text=source.content)
 
     async def _route(self, task, state, nodes, tasks=(), preferred_models=None):
         attempt = self.store.reserve_attempt(task["id"], 0.001,

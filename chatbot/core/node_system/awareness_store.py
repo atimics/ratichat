@@ -358,12 +358,18 @@ class AwarenessStore:
                                  (str(summary)[:1200], content_version, node_id, content_version))
             return {"updated": bool(updated.rowcount), "conflict": not bool(updated.rowcount)}
 
-    def snapshot_versions(self, platform, channel_id, sender_id, nodes):
+    def snapshot_versions(self, platform, channel_id, sender_id, nodes, *, event_id=None):
         """Pin source events so later conversation activity keeps task inputs stable."""
         platform, channel_id, sender_id = self._scope(platform, channel_id, sender_id)
         with self._transaction() as db:
             actor = self._actor(db, platform, sender_id)
             versions = {}
+            if event_id:
+                event = db.execute("SELECT * FROM awareness_messages WHERE platform=? AND channel_id=? AND event_id=? AND deleted=0",
+                    (platform, channel_id, event_id)).fetchone()
+                if not event or self._canonical(db, event["actor_id"]) != actor:
+                    raise PermissionError("Snapshot the current sender's source event")
+                versions["event:" + event["event_key"]] = event["revision"]
             for node_id, value in nodes.items():
                 row = db.execute("SELECT * FROM awareness_nodes WHERE id=? AND valid=1", (node_id,)).fetchone()
                 if not row or row["version"] != value.get("version") or not self._can_read(db, row, platform, channel_id, actor):

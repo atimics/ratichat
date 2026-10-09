@@ -15,7 +15,7 @@ from chatbot.core.model_router import CHAT_URL, DECISIONS_URL, ModelRouter
 from chatbot.core.node_system.awareness_store import AwarenessStore
 from chatbot.core.node_system.processor import NodeProcessor
 from chatbot.core.node_system.task_service import TaskService
-from chatbot.core.orchestration.capability_policy import CapabilityPolicy
+from chatbot.core.orchestration.capability_policy import CapabilityPolicy, ExecutionScope
 from chatbot.core.orchestration.main_orchestrator import TraditionalProcessor
 from chatbot.core.world_state import WorldStateManager
 from chatbot.core.world_state.payload_builder import PayloadBuilder
@@ -152,6 +152,8 @@ async def test_model_choices_are_local_during_parallel_calls(tmp_path):
     source = message(processor, store, "discord", "general", "owner", "d1", "research")
     first = await service.prepare(processor.world_state.get_channel("general"), source)
     other = Message("d2", "discord", "owner", "code", time.time(), channel_id="general")
+    from dataclasses import asdict
+    store.ingest_message("discord", "general", asdict(other))
     second = await service.prepare(processor.world_state.get_channel("general"), other)
     second.route = route("openai/gpt-6-luna")
     engine = AIDecisionEngine("key", model="default/model")
@@ -295,3 +297,19 @@ async def test_account_confirmation_requires_the_human_message(tmp_path):
     with service.activate(binding):
         result = await service.execute_tool("link_chat_account", {"stage": "confirm", "link_id": link["link_id"]}, scope)
     assert result["stage"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_chat_activity_during_routing_preserves_original_event_evidence(tmp_path):
+    processor, service, store, ai, sends = setup(tmp_path)
+    source = message(processor, store, "discord", "general", "owner", "d1", "Research the shared project")
+    async def route_during_activity(state, **kwargs):
+        for index in range(15):
+            store.ingest_message("discord", "general", {"id": f"new-{index}", "sender": "guest", "content": "New chat activity", "timestamp": time.time() + index})
+        return route()
+    service.router.select_route = route_during_activity
+    binding = await service.prepare(processor.world_state.get_channel("general"), source)
+    saved = store.record_result(binding.task["id"], {"kind": "reply", "content": "Project evidence"}, input_versions=binding.input_versions)
+    assert saved["accepted"]
+    store.delete_message("discord", "general", "d1")
+    assert store.get_task(binding.task["id"])["status"] == "needs_refresh"
