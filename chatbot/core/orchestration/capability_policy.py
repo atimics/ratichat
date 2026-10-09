@@ -4,9 +4,9 @@ from dataclasses import dataclass
 from typing import Any, Collection, Mapping
 
 
-READ_ONLY_SOURCE_TOOLS = frozenset({"web_search", "read_webpage", "read_feed", "read_news", "list_public_sources", "search_social", "read_bluesky_feed"})
-WATCH_READ_TOOLS = frozenset({"list_source_watches", "get_source_digest"})
-WATCH_WRITE_TOOLS = frozenset({"create_source_watch", "remove_source_watch"})
+READ_ONLY_SOURCE_TOOLS = frozenset({"web_search", "read_webpage", "read_feed", "read_news", "list_public_sources", "search_social", "read_bluesky_feed", "check_onchain_activity"})
+WATCH_READ_TOOLS = frozenset({"list_source_watches", "get_source_digest", "list_live_monitors"})
+WATCH_WRITE_TOOLS = frozenset({"create_source_watch", "remove_source_watch", "create_live_monitor", "stop_live_monitor"})
 SOURCE_WATCH_TOOLS = WATCH_READ_TOOLS | WATCH_WRITE_TOOLS
 PROACTIVE_READ_TOOLS = frozenset({"get_proactive_status"})
 PROACTIVE_WRITE_TOOLS = frozenset({"configure_proactive"})

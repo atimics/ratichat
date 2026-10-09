@@ -237,6 +237,43 @@ async def test_workers_read_fresh_sources_and_only_expanded_details(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_worker_keeps_full_addresses_and_reads_live_sources_in_its_own_scope(tmp_path):
+    processor, service, store, ai, sends = setup(tmp_path)
+    addresses = ["0x" + str(i) * 40 for i in range(8)]
+    text = "Review this alert " + "context " * 200 + " ".join(addresses)
+    source = message(processor, store, "discord", "general", "owner", "d1", text)
+    binding = await service.prepare(processor.world_state.get_channel("general"), source)
+    live = AsyncMock(return_value={"status": "success", "usage": {"cost": 0.003}, "sources": [{"url": "https://example.com", "content": "LIVE RECORD"}]})
+    registry = processor.executor.tool_registry
+    registry.register_tool(SimpleNamespace(name="web_search", description="Live search", parameters_schema={"query": "string"}, execute=live))
+    service.configure_read_tools(registry, processor.executor.action_context, processor.policy)
+    ai.plan_task_worker = AsyncMock(side_effect=[{"tool": "web_search", "parameters": {"query": "Verify the alert"}}, {"tool": None}])
+    await service._worker(binding, {"goal": "Verify the alert"}, 0)
+    payload = ai.compose_task_worker.call_args.args[0]
+    assert all(a in payload["original_request"] for a in addresses)
+    assert "LIVE RECORD" in json.dumps(payload["tool_results"])
+    scope = live.call_args.args[1].execution_scope
+    assert scope.latest_event_id == "d1" and scope.channel_id == "general"
+    assert not hasattr(processor.executor.action_context, "execution_scope")
+    root = store.get_task(binding.task["id"])
+    assert root["spent_usd"] >= 0.003 and root["reserved_usd"] == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_read_scope_rejects_monitor_writes(tmp_path):
+    processor, service, store, ai, sends = setup(tmp_path)
+    source = message(processor, store, "discord", "general", "owner", "d1", "Research wallets")
+    binding = await service.prepare(processor.world_state.get_channel("general"), source)
+    write = AsyncMock()
+    processor.executor.tool_registry.register_tool(SimpleNamespace(name="create_live_monitor", description="Monitor", parameters_schema={}, execute=write))
+    service.configure_read_tools(processor.executor.tool_registry, processor.executor.action_context, processor.policy)
+    ai.plan_task_worker = AsyncMock(return_value={"tool": "create_live_monitor", "parameters": {}})
+    await service._worker(binding, {"goal": "Research"}, 0)
+    write.assert_not_awaited()
+    assert ai.compose_task_worker.call_args.args[0]["tool_results"][0]["status"] == "blocked"
+
+
+@pytest.mark.asyncio
 async def test_proactive_composition_uses_shared_context_and_task_route(tmp_path):
     from chatbot.core.node_system.proactive_sources import ProactiveSourceService
     processor, service, store, ai, sends = setup(tmp_path)

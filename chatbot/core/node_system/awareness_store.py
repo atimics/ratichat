@@ -504,7 +504,7 @@ class AwarenessStore:
             identity = "task:" + uuid.uuid4().hex
             now = self.clock()
             db.execute("""INSERT INTO awareness_tasks(id,actor_id,platform,channel_id,audience_kind,audience_key,goal,topic,persona_id,parent_id,budget,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (identity, actor, platform, channel_id, *target, str(goal)[:2000], str(topic)[:100], str(persona_id)[:100], parent_id, budget, now, now))
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (identity, actor, platform, channel_id, *target, str(goal)[:4000], str(topic)[:100], str(persona_id)[:100], parent_id, budget, now, now))
             db.execute("INSERT INTO awareness_task_requests VALUES(?,?,?,?)", (platform, channel_id, event_id, identity))
             self._task_node(db, identity)
             return self._task(db, db.execute("SELECT * FROM awareness_tasks WHERE id=?", (identity,)).fetchone())

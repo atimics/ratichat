@@ -475,6 +475,8 @@ class MainOrchestrator:
         self.steward_task = None
         self.source_watch_service = None
         self.source_watch_task = None
+        self.live_monitor_service = None
+        self.live_monitor_task = None
         self.proactive_source_service = None
         self.proactive_source_task = None
         
@@ -494,6 +496,8 @@ class MainOrchestrator:
         
         # Initialize tool registry and register tools
         self._register_all_tools()
+        if self.task_service:
+            self.task_service.configure_read_tools(self.tool_registry, self.action_context, self.capability_policy)
 
     def _register_all_tools(self):
         """Register all available tools with the tool registry."""
@@ -577,6 +581,10 @@ class MainOrchestrator:
         self.tool_registry.register_tool(WebSearchTool())
         self.tool_registry.register_tool(ReadWebpageTool())
         self.tool_registry.register_tool(ReadFeedTool())
+        from ...tools.onchain_tools import CheckOnchainActivityTool
+        from ...tools.live_monitor_tools import CreateLiveMonitorTool, ListLiveMonitorsTool, StopLiveMonitorTool
+        for tool in (CheckOnchainActivityTool(), CreateLiveMonitorTool(), ListLiveMonitorsTool(), StopLiveMonitorTool()):
+            self.tool_registry.register_tool(tool)
         from ...tools.task_tools import GetTaskStatusTool, RunTaskWorkersTool, LinkChatAccountTool, GetModelCatalogTool
         if self.task_service:
             self.tool_registry.register_tool(GetTaskStatusTool())
@@ -706,6 +714,7 @@ class MainOrchestrator:
             # Set up processing hub with traditional processor
             self._setup_processing_components()
             self.source_watch_task = asyncio.create_task(self._source_watch_loop())
+            self.live_monitor_task = asyncio.create_task(self._live_monitor_loop())
             self.proactive_source_task = asyncio.create_task(self._proactive_source_loop())
             
             # Start the proactive conversation engine
@@ -738,6 +747,10 @@ class MainOrchestrator:
             self.proactive_source_task.cancel()
             await asyncio.gather(self.proactive_source_task, return_exceptions=True)
             self.proactive_source_task = None
+        if self.live_monitor_task:
+            self.live_monitor_task.cancel()
+            await asyncio.gather(self.live_monitor_task, return_exceptions=True)
+            self.live_monitor_task = None
         if self.steward_task:
             self.steward_task.cancel()
             await asyncio.gather(self.steward_task, return_exceptions=True)
@@ -809,6 +822,14 @@ class MainOrchestrator:
             daily_lookup_budget=settings.SOURCE_WATCH_DAILY_LOOKUP_BUDGET)
         self.action_context.source_watch_service = self.source_watch_service
         node_processor.watch_service = self.source_watch_service
+        from ..node_system.live_monitors import MonitorStore, LiveMonitorService
+        from ...tools.onchain_tools import OnchainReader
+        monitor_store = MonitorStore(self.config.db_path, owner_ids=owner_ids, allowed_channels=allowed_channels)
+        self.action_context.onchain_reader = OnchainReader()
+        self.live_monitor_service = LiveMonitorService(monitor_store, reader=self.action_context.onchain_reader,
+            send=delivery.send, reconcile=delivery.reconcile,
+            daily_lookup_budget=settings.LIVE_MONITOR_DAILY_LOOKUP_BUDGET)
+        self.action_context.live_monitor_service = self.live_monitor_service
         from ..node_system.proactive_sources import ProactiveStore, ProactiveSourceService
         proactive_channels = {value.strip() for value in settings.PROACTIVE_DISCORD_CHANNEL_IDS.split(",") if value.strip()} & self.capability_policy.approved_discord_channel_ids
         proactive_store = ProactiveStore(self.config.db_path, owner_ids["discord"], proactive_channels, settings.PROACTIVE_TIMEZONE)
@@ -827,6 +848,16 @@ class MainOrchestrator:
             except Exception:
                 logger.exception("Source watch check needs another attempt")
             await asyncio.sleep(60)
+
+    async def _live_monitor_loop(self):
+        while self.running:
+            try:
+                await self.live_monitor_service.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Live monitor check needs another attempt")
+            await asyncio.sleep(30)
 
     async def _proactive_source_loop(self):
         while self.running:

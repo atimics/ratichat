@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 from ...config import settings
 from ..model_router import record_inference
+from ..orchestration.capability_policy import READ_ONLY_SOURCE_TOOLS, ExecutionScope
 
 
 PERSONAS = [
@@ -47,6 +48,63 @@ class TaskService:
         self.router = router
         self.ai_engine = ai_engine
         self.budget_usd = budget_usd or settings.TASK_BUDGET_USD
+        self.read_tools = None
+        self.action_context = None
+        self.read_policy = None
+
+    def configure_read_tools(self, registry, context, policy):
+        self.read_tools, self.action_context, self.read_policy = registry, context, policy
+
+    async def _review_worker(self, binding, payload):
+        """Give each worker its own fixed scope and up to three live reads."""
+        payload["tool_results"] = []
+        if self.read_tools and self.read_policy:
+            scope = ExecutionScope(binding.channel_id, binding.platform, frozenset({binding.event_id}),
+                                   binding.event_id, binding.sender_id)
+            context = copy.copy(self.action_context)
+            context.execution_scope = scope
+            names = self.read_policy.filter_tool_names(self.read_tools.get_tool_names(), scope) & READ_ONLY_SOURCE_TOOLS
+            payload["available_tools"] = self.read_tools.get_tool_descriptions_for_ai(names)
+            seen = set()
+            for remaining in (3, 2, 1):
+                payload["lookup_budget_remaining"] = remaining
+                plan = await self.ai_engine.plan_task_worker(payload)
+                if not isinstance(plan, dict) or not plan.get("tool"):
+                    break
+                name, params = plan.get("tool"), plan.get("parameters", {})
+                tool = self.read_tools.get_enabled_tool(name) if name in names else None
+                if not tool or not isinstance(params, dict) or set(params) - set(tool.parameters_schema):
+                    payload["tool_results"].append({"tool": name, "status": "blocked", "message": "Choose a listed read tool and parameters."})
+                    break
+                signature = json.dumps([name, params], sort_keys=True)
+                if signature in seen:
+                    break
+                seen.add(signature)
+                denial = self.read_policy.denial_reason(name, params, scope)
+                if denial:
+                    break
+                attempt = None
+                if name in {"web_search", "search_social"}:
+                    attempt = self.store.reserve_attempt(binding.task["id"], 0.02,
+                        request_key=f"worker-lookup:{binding.event_id}:{time.time_ns()}:{signature}",
+                        input_versions=binding.input_versions)
+                    if not attempt.get("reserved"):
+                        raise ValueError("Use a fresh worker source snapshot.")
+                result = None
+                try:
+                    result = await tool.execute(params, context)
+                finally:
+                    if attempt:
+                        cost = (result or {}).get("usage", {}).get("cost")
+                        if cost is None:
+                            cost = 0 if (result or {}).get("http_status") in {400, 401, 402, 403, 404, 413, 422, 429} else attempt["reserved_usd"]
+                        self.store.record_result(binding.task["id"], {"kind": "worker_lookup", "tool": name},
+                            attempt_id=attempt["id"], cost_usd=cost, input_versions=binding.input_versions, status="active")
+                payload["tool_results"].append({"tool": name, "parameters": params, "trust": "untrusted_source", "result": result})
+                if isinstance(result, dict):
+                    self.store.record_result(binding.task["id"], {"kind": "worker_evidence", "tool": name,
+                        "parameters": params, "result": result}, input_versions=binding.input_versions, status="active")
+        return await self.ai_engine.compose_task_worker(payload)
 
     async def prepare(self, channel, source, *, proactive=False):
         nodes = self.store.catalog(channel.type, channel.id, source.sender, query=source.content)
@@ -60,7 +118,7 @@ class TaskService:
             if candidate:
                 task = self.store.continue_task(identity, channel.type, channel.id, source.sender, source.id)
         task = task or self.store.task_for_request(channel.type, channel.id, source.sender, source.id,
-            goal=source.content[:2000], budget_usd=self.budget_usd)
+            goal=source.content[:4000], budget_usd=self.budget_usd)
         route = task.get("route")
         if not route:
             tasks = [] if proactive else self.store.list_tasks(channel.type, channel.id, source.sender)
@@ -218,13 +276,15 @@ class TaskService:
             route["persona"] = job.get("persona", "researcher")
             self.store.save_route(child["id"], route, input_versions=parent.input_versions)
             binding = TaskBinding(self, child, parent.platform, parent.channel_id, parent.sender_id,
-                parent.event_id, parent.nodes, route, input_versions=parent.input_versions)
+                parent.event_id, parent.nodes, route, input_versions=parent.input_versions, request_text=parent.request_text)
             with self.activate(binding):
-                result = await asyncio.wait_for(self.ai_engine.compose_task_worker({
+                result = await asyncio.wait_for(self._review_worker(binding, {
                     "goal": job["goal"][:2000], "persona": route["persona"],
+                    "original_request": parent.request_text[:4000], "original_task_goal": parent.task.get("goal", "")[:4000],
+                    "source_event_id": parent.event_id,
                     "nodes": {k: v if k in route.get("expanded_nodes", []) or k in parent.fresh_nodes
                         else {"summary": v["summary"], "version": v["version"], "kind": v["kind"]}
-                        for k, v in parent.nodes.items()}, "task_route": route}), 60)
+                        for k, v in parent.nodes.items()}, "task_route": route}), 150)
             if result:
                 saved = self.store.record_result(child["id"], {"kind": "worker", "content": result},
                     input_versions=parent.input_versions)
