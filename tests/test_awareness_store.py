@@ -207,6 +207,35 @@ def test_task_event_cannot_be_reassigned(store):
     assert store.get_task_for_event("discord", "general", "request")["id"] == first["id"]
 
 
+def test_routing_placeholder_transfers_its_cost_into_continued_task(store):
+    original = task(store)
+    store.save_route(original["id"], {"model": "fast"})
+    placeholder = store.task_for_request("matrix", "room", "bob", "follow-up")
+    attempt = store.reserve_attempt(placeholder["id"], 0.001, "route:follow-up")
+    store.record_result(placeholder["id"], {"kind": "route", "receipt": {}}, attempt_id=attempt["id"], cost_usd=0.000042, status="active")
+    continued = store.continue_task(original["id"], "matrix", "room", "bob", "follow-up", replace_task_id=placeholder["id"])
+    assert continued["spent_usd"] == 0.000042 and continued["route"]["model"] == "fast"
+    assert continued["results"][0]["result"]["kind"] == "route"
+    assert store.get_task_for_event("matrix", "room", "follow-up")["id"] == original["id"]
+    assert store.get_task(placeholder["id"])["status"] == "retired"
+    repeated = store.continue_task(original["id"], "matrix", "room", "bob", "follow-up", replace_task_id=placeholder["id"])
+    assert repeated["spent_usd"] == 0.000042
+
+
+def test_placeholder_transfer_checks_target_budget_and_source_attempt_kind(store):
+    original = task(store, budget_usd=0.00001)
+    placeholder = store.task_for_request("matrix", "room", "bob", "follow-up")
+    attempt = store.reserve_attempt(placeholder["id"], 0.001, "route:follow-up")
+    store.record_result(placeholder["id"], {"kind": "route"}, attempt_id=attempt["id"], cost_usd=0.000042, status="active")
+    with pytest.raises(ValueError):
+        store.continue_task(original["id"], "matrix", "room", "bob", "follow-up", replace_task_id=placeholder["id"])
+    assert store.get_task_for_event("matrix", "room", "follow-up")["id"] == placeholder["id"]
+    store.record_result(placeholder["id"], {"kind": "inference"}, status="active")
+    other = store.task_for_request("discord", "general", "alice", "larger")
+    with pytest.raises(ValueError):
+        store.continue_task(other["id"], "matrix", "room", "bob", "follow-up", replace_task_id=placeholder["id"])
+
+
 def test_route_and_attempt_restore_after_restart(tmp_path):
     path = tmp_path / "task.db"
     first = AwarenessStore(path, allowed_channels=ALLOWED, community_channels=COMMUNITY)
@@ -323,6 +352,38 @@ def test_edit_invalidates_completed_task_and_accepted_result_history(store):
     updated = store.get_task(saved["id"])
     assert updated["status"] == "needs_refresh"
     assert updated["result"] is None and updated["results"] == []
+
+
+def test_event_snapshots_keep_completed_tasks_after_new_messages(store):
+    store.ingest_message("discord", "general", message())
+    versions = store.snapshot_versions("discord", "general", "alice", store.catalog("discord", "general", "alice"))
+    assert len(versions) == 1 and next(iter(versions)).startswith("event:")
+    saved = task(store)
+    store.save_route(saved["id"], {"model": "fast"}, input_versions=versions)
+    assert store.record_result(saved["id"], {"answer": "Research complete"})["accepted"]
+    store.ingest_message("discord", "general", message("Bot reply", event="bot", sender="ratichat", timestamp=200))
+    store.ingest_message("discord", "general", message("Unrelated discussion", event="later", timestamp=300))
+    assert store.get_task(saved["id"])["status"] == "complete"
+    assert store.get_task(saved["id"])["result"] == {"answer": "Research complete"}
+    assert "tasks." + saved["id"] in store.catalog("matrix", "room", "bob")
+    store.edit_message("discord", "general", "e1", {"sender": "alice", "content": "Changed project", "source_revision": 2})
+    assert store.get_task(saved["id"])["status"] == "needs_refresh"
+    assert store.get_task(saved["id"])["results"] == []
+
+
+def test_event_snapshot_rejects_stale_or_private_inputs(store):
+    store.ingest_message("discord", "local", message())
+    local = store.catalog("discord", "local", "alice")
+    with pytest.raises(ValueError):
+        store.snapshot_versions("matrix", "room", "bob", local)
+    versions = store.snapshot_versions("discord", "local", "alice", local)
+    shared = task(store)
+    with pytest.raises(PermissionError):
+        store.save_route(shared["id"], {"model": "fast"}, input_versions=versions)
+    personal = store.task_for_request("discord", "local", "alice", "personal", audience="personal")
+    assert store.save_route(personal["id"], {"model": "fast"}, input_versions=versions)["saved"]
+    store.delete_message("discord", "local", "e1")
+    assert store.save_route(personal["id"], {"model": "fast"}, input_versions=versions)["conflict"]
 
 
 @pytest.mark.parametrize("amount", [-1, float("nan"), float("inf"), 2])

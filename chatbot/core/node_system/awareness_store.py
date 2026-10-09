@@ -358,6 +358,26 @@ class AwarenessStore:
                                  (str(summary)[:1200], content_version, node_id, content_version))
             return {"updated": bool(updated.rowcount), "conflict": not bool(updated.rowcount)}
 
+    def snapshot_versions(self, platform, channel_id, sender_id, nodes):
+        """Pin source events so later conversation activity keeps task inputs stable."""
+        platform, channel_id, sender_id = self._scope(platform, channel_id, sender_id)
+        with self._transaction() as db:
+            actor = self._actor(db, platform, sender_id)
+            versions = {}
+            for node_id, value in nodes.items():
+                row = db.execute("SELECT * FROM awareness_nodes WHERE id=? AND valid=1", (node_id,)).fetchone()
+                if not row or row["version"] != value.get("version") or not self._can_read(db, row, platform, channel_id, actor):
+                    raise ValueError("Snapshot current nodes from your allowed catalog")
+                if row["kind"] == "task":
+                    continue
+                if row["kind"] == "conversation":
+                    for ref in json.loads(row["evidence_json"]):
+                        if ref["kind"] == "event":
+                            versions["event:" + ref["id"]] = ref["version"]
+                else:
+                    versions[node_id] = row["version"]
+            return versions
+
     def catalog(self, platform, channel_id, sender_id, query="", *, limit=24, max_chars=16000):
         platform, channel_id, sender_id = self._scope(platform, channel_id, sender_id)
         limit, max_chars = max(0, min(int(limit), 100)), max(0, min(int(max_chars), 100000))
@@ -511,7 +531,7 @@ class AwarenessStore:
             self._task_node(db, child_id)
             return self._task(db, db.execute("SELECT * FROM awareness_tasks WHERE id=?", (child_id,)).fetchone())
 
-    def continue_task(self, task_id, platform, channel_id, sender_id, event_id):
+    def continue_task(self, task_id, platform, channel_id, sender_id, event_id, *, replace_task_id=None):
         platform, channel_id, sender_id = self._scope(platform, channel_id, sender_id)
         if not event_id:
             raise ValueError("A trusted continuation event ID is required")
@@ -522,14 +542,53 @@ class AwarenessStore:
                 raise PermissionError("Continue an allowed task")
             previous = db.execute("SELECT task_id FROM awareness_task_requests WHERE platform=? AND channel_id=? AND event_id=?", (platform, channel_id, event_id)).fetchone()
             if previous and previous[0] != task_id:
-                raise ValueError("This request already refers to another task")
+                if not replace_task_id or previous[0] != replace_task_id:
+                    raise ValueError("This request already refers to another task")
+                placeholder = db.execute("SELECT * FROM awareness_tasks WHERE id=?", (replace_task_id,)).fetchone()
+                if (not placeholder or not self._task_access(db, placeholder, platform, channel_id, actor)
+                        or self._canonical(db, placeholder["actor_id"]) != actor or placeholder["parent_id"]
+                        or placeholder["route_id"] or placeholder["status"] not in {"queued", "active"}
+                        or db.execute("SELECT 1 FROM awareness_tasks WHERE parent_id=?", (replace_task_id,)).fetchone()
+                        or db.execute("SELECT COUNT(*) FROM awareness_task_requests WHERE task_id=?", (replace_task_id,)).fetchone()[0] != 1):
+                    raise PermissionError("Replace a fresh routing placeholder from this request")
+                attempts = db.execute("SELECT * FROM awareness_attempts WHERE task_id=?", (replace_task_id,)).fetchall()
+                for attempt in attempts:
+                    route_result = json.loads(attempt["result_json"]) if attempt["result_json"] else {}
+                    if not (attempt["status"] == "active" and route_result.get("kind") == "route"
+                            or attempt["status"] == "reserved" and attempt["request_key"].startswith("route:")):
+                        raise ValueError("Transfer only the request's routing attempts")
+                for target in self._chain(db, task_id):
+                    if target["spent"] + target["reserved"] + placeholder["spent"] + placeholder["reserved"] > target["budget"]:
+                        raise ValueError("Use the continued task's remaining budget")
+                    db.execute("UPDATE awareness_tasks SET spent=spent+?,reserved=reserved+?,updated_at=? WHERE id=?",
+                               (placeholder["spent"], placeholder["reserved"], self.clock(), target["id"]))
+                for attempt in attempts:
+                    db.execute("UPDATE awareness_attempts SET task_id=?,request_key=? WHERE id=?",
+                               (task_id, "moved:" + replace_task_id + ":" + attempt["request_key"], attempt["id"]))
+                db.execute("UPDATE awareness_task_requests SET task_id=? WHERE platform=? AND channel_id=? AND event_id=?", (task_id, platform, channel_id, event_id))
+                db.execute("UPDATE awareness_tasks SET status='retired',spent=0,reserved=0,result_json=NULL,updated_at=? WHERE id=?", (self.clock(), replace_task_id))
+                self._invalidate(db, "node", "tasks." + replace_task_id)
+                db.execute("UPDATE awareness_nodes SET valid=0,summary='',summary_version=0 WHERE id=?", ("tasks." + replace_task_id,))
             db.execute("INSERT OR IGNORE INTO awareness_task_requests VALUES(?,?,?,?)", (platform, channel_id, event_id, task_id))
-            return self._task(db, row)
+            if not previous or previous[0] != task_id:
+                db.execute("UPDATE awareness_tasks SET status='active',updated_at=? WHERE id=?", (self.clock(), task_id))
+                self._task_node(db, task_id)
+            return self._task(db, db.execute("SELECT * FROM awareness_tasks WHERE id=?", (task_id,)).fetchone())
 
     def _versions(self, db, versions, task=None):
         for node_id, version in (versions or {}).items():
             if task and node_id == "tasks." + task["id"]:
                 raise ValueError("Use evidence nodes outside the task's own projection")
+            if node_id.startswith("event:"):
+                event = db.execute("SELECT * FROM awareness_messages WHERE event_key=? AND deleted=0", (node_id[len("event:"):],)).fetchone()
+                if not event or event["revision"] != version:
+                    return False
+                if task:
+                    audience = self._audience(event["platform"], event["channel_id"], event["actor_id"])
+                    local_personal = task["audience_kind"] == "personal" and (event["platform"], event["channel_id"]) == (task["platform"], task["channel_id"])
+                    if not local_personal and not self._can_derive(db, (task["audience_kind"], task["audience_key"]), {"audience_kind": audience[0], "audience_key": audience[1]}):
+                        raise PermissionError("Keep source event inputs within the task audience")
+                continue
             node = db.execute("SELECT * FROM awareness_nodes WHERE id=? AND valid=1", (node_id,)).fetchone()
             if not node or node["version"] != version:
                 return False
@@ -652,7 +711,7 @@ class AwarenessStore:
         task = db.execute("SELECT * FROM awareness_tasks WHERE id=?", (task_id,)).fetchone()
         data = {"task_id": task_id, "goal": task["goal"], "topic": task["topic"], "persona_id": task["persona_id"],
                 "status": task["status"], "result": json.loads(task["result_json"]) if task["result_json"] else None}
-        refs = [{"kind": "node", "id": node, "version": version} for node, version in json.loads(task["input_json"]).items()]
+        refs = [{"kind": "event" if node.startswith("event:") else "node", "id": node[len("event:"):] if node.startswith("event:") else node, "version": version} for node, version in json.loads(task["input_json"]).items()]
         self._write_node(db, "tasks." + task_id, "task", data, (task["audience_kind"], task["audience_key"]), refs)
 
     def begin_link(self, platform, channel_id, sender_id, target_platform, target_account_id):
