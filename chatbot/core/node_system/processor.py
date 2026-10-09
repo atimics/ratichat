@@ -1,5 +1,6 @@
 """Process one chat request through scoped nodes and bounded source lookups."""
 
+import asyncio
 import copy
 import json
 import logging
@@ -10,7 +11,7 @@ import time
 
 from ...config import settings
 from ..ai_engine import ActionPlan
-from ..orchestration.capability_policy import READ_ONLY_SOURCE_TOOLS, SOURCE_WATCH_TOOLS, PROACTIVE_SOURCE_TOOLS, STATE_TOOLS
+from ..orchestration.capability_policy import READ_ONLY_SOURCE_TOOLS, SOURCE_WATCH_TOOLS, PROACTIVE_SOURCE_TOOLS, STATE_TOOLS, TASK_TOOLS
 from .interaction_tools import NodeInteractionTools
 from .node_manager import NodeManager
 from .research_store import ResearchStore
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 NODE_TOOLS = frozenset({"expand_node", "collapse_node", "pin_node", "unpin_node", "get_expansion_status"})
 MANAGEMENT_TOOLS = frozenset({"manage_matrix_room", "manage_matrix_server", "matrix_server_status"})
 REPLY_TOOLS = frozenset({"send_discord_reply", "send_matrix_reply", "send_farcaster_reply"})
-STATE_RESULT_PREFIXES = ("sources.watch_result_", "sources.proactive_result_")
+STATE_RESULT_PREFIXES = ("sources.watch_result_", "sources.proactive_result_", "sources.task_result_")
 
 
 def capture_request(world_state, policy, store, channel_id, message, *, accepted=False):
@@ -50,7 +51,7 @@ class NodeProcessor:
     MAX_STEPS = 5
     MAX_LOOKUPS = 3
 
-    def __init__(self, world_state, payload_builder, executor, db_path, research_store=None):
+    def __init__(self, world_state, payload_builder, executor, db_path, research_store=None, awareness_store=None, task_service=None):
         self.world_state = world_state
         self.payload_builder = payload_builder
         self.executor = executor
@@ -66,6 +67,11 @@ class NodeProcessor:
         self._last_receipt_check = {}
         self._last_cleanup = 0
         self.watch_service = None
+        self.awareness_store = awareness_store
+        self.task_service = task_service
+        self._cycle_lock = asyncio.Lock()
+        self._binding = None
+        self._view = None
         if db_path != ":memory:":
             with sqlite3.connect(db_path) as db:
                 db.execute("CREATE TABLE IF NOT EXISTS node_request_receipts (channel_id TEXT, event_id TEXT, PRIMARY KEY (channel_id, event_id))")
@@ -121,6 +127,10 @@ class NodeProcessor:
         return node
 
     async def process_cycle(self, cycle_id, primary_channel_id, context=None):
+        async with self._cycle_lock:
+            return await self._process_cycle(cycle_id, primary_channel_id, context)
+
+    async def _process_cycle(self, cycle_id, primary_channel_id, context=None):
         channel = self.world_state.get_channel(primary_channel_id)
         if channel and channel.type == "farcaster":
             return await self._run_cycle(cycle_id, primary_channel_id, context)
@@ -169,6 +179,11 @@ class NodeProcessor:
     async def _deliver(self, turn):
         channel = self._saved_channel(turn)
         self._restore_discord(turn)
+        if self.awareness_store and not self.awareness_store.request_current(channel.type, channel.id,
+                turn["event_id"], turn["snapshot"]["source"]["content"]):
+            self.research_store.fail(turn["id"], turn["delivery_token"], "Use the current message version",
+                                     phase="delivery", retryable=False)
+            return {"status": "blocked", "message": "Use the current message version."}
         payload = self.payload_builder.build_request_node_payload(channel, self.node_manager)
         scope = self.policy.scope_from_payload(payload)
         name = {"discord": "send_discord_reply", "matrix": "send_matrix_reply"}[channel.type]
@@ -185,6 +200,7 @@ class NodeProcessor:
         token = turn["delivery_token"]
         if result.get("status") == "success":
             self.research_store.sent(turn["id"], token, result)
+            self._confirmed_reply(turn, result)
             if channel.type == "discord" and result.get("message_id"):
                 self.world_state.add_message(channel.id, Message(
                     id=result["message_id"], channel_type="discord", channel_id=channel.id,
@@ -198,6 +214,19 @@ class NodeProcessor:
                                      phase="delivery", retry_after=10 * turn["delivery_attempts"],
                                      retryable=result.get("status") != "blocked" and result.get("retryable", True))
         return result
+
+    def _confirmed_reply(self, turn, receipt):
+        if not self.awareness_store:
+            return
+        task = self.awareness_store.get_task_for_event(turn["platform"], turn["channel_id"], turn["event_id"])
+        if task:
+            self.awareness_store.record_result(task["id"], {"kind": "reply", "content": turn["reply"], "receipt": receipt},
+                input_versions=task["input_versions"])
+        message_id = receipt.get("message_id") or receipt.get("event_id")
+        if message_id:
+            self.awareness_store.ingest_message(turn["platform"], turn["channel_id"], {
+                "id": message_id, "sender": "ratichat", "content": turn["reply"], "timestamp": time.time(),
+                "reply_to": turn["event_id"], "metadata": {"is_bot": True, "confirmed": True}})
 
     async def _check_receipts(self, channel_id):
         self._last_receipt_check[channel_id] = time.time()
@@ -215,8 +244,57 @@ class NodeProcessor:
                     result["status"] = "success"
             if result and result.get("status") == "success":
                 self.research_store.resolve_delivery(turn["id"], result)
+                self._confirmed_reply(turn, result)
 
     async def _run_cycle(self, cycle_id, primary_channel_id, context=None, channel=None, turn=None):
+        channel = channel or self.world_state.get_channel(primary_channel_id)
+        self._binding, self._view = None, None
+        approved = channel and (channel.type == "discord" and channel.id in self.policy.approved_discord_channel_ids
+            or channel.type == "matrix" and channel.id in self.policy.approved_matrix_room_ids)
+        if not self.task_service or not approved or not channel.recent_messages:
+            return await self._run_cycle_inner(cycle_id, primary_channel_id, context, channel, turn)
+        source = channel.recent_messages[-1]
+        if source.metadata.get("is_bot") or not self.ai_engine.api_key:
+            return self._result(0, 0, 0)
+        for message in channel.recent_messages:
+            # Intake already holds the latest version. Replaying a saved request
+            # must preserve edits and tombstones from newer platform events.
+            if not turn:
+                self.awareness_store.ingest_message(channel.type, channel.id, asdict(message))
+        if not self.awareness_store.request_current(channel.type, channel.id, source.id, source.content):
+            if turn:
+                self.research_store.fail(turn["id"], turn["lease_token"], "Use the current message version", retryable=False)
+            return self._result(0, 0, 0, failed=True)
+        try:
+            self._binding = await self.task_service.prepare(channel, source)
+            self._view = self.awareness_store.load_view(self._view_id(channel, source), channel.type, channel.id, source.sender)
+            with self.task_service.activate(self._binding):
+                return await self._run_cycle_inner(cycle_id, primary_channel_id, context, channel, turn)
+        except (ValueError, PermissionError) as error:
+            logger.warning("Saved task needs attention: %s", error)
+            if turn and self.awareness_store.request_current(channel.type, channel.id, source.id, source.content):
+                scope = self.policy.scope_from_payload(self.payload_builder.build_request_node_payload(channel, self.node_manager))
+                action = ActionPlan("send_discord_reply" if channel.type == "discord" else "send_matrix_reply",
+                    {"channel_id": channel.id, "reply_to_id": source.id,
+                     "content": "This saved task needs a fresh start. Please ask me to start a new task for this topic."}, "Report saved task status", 1)
+                await self._save_and_send(action, scope, turn, {})
+            elif turn:
+                self.research_store.fail(turn["id"], turn["lease_token"], "Use a current source version", retryable=False)
+            return self._result(0, 0, 0, failed=True)
+        finally:
+            if self._binding and self._view is not None:
+                paths = set(self._binding.nodes) & set(self.awareness_store.catalog(channel.type, channel.id, source.sender))
+                self.awareness_store.save_view(self._view_id(channel, source), channel.type, channel.id, source.sender,
+                    expanded=[k for k in self.node_manager.get_expanded_nodes() if k in paths],
+                    collapsed=[k for k in paths if not self.node_manager.get_node_metadata(k).is_expanded],
+                    pins=[k for k in paths if self.node_manager.get_node_metadata(k).is_pinned],
+                    expected_revision=self._view["revision"])
+
+    @staticmethod
+    def _view_id(channel, source):
+        return f"{channel.type}:{channel.id}:{source.sender}"
+
+    async def _run_cycle_inner(self, cycle_id, primary_channel_id, context=None, channel=None, turn=None):
         channel = channel or self.world_state.get_channel(primary_channel_id)
         if not channel or not channel.recent_messages or not self.ai_engine.api_key:
             return {"actions_executed": 0}
@@ -244,10 +322,24 @@ class NodeProcessor:
 
         self.node_manager.node_metadata.clear()
         self.node_manager.system_events.clear()
+        self.node_manager.max_expanded_nodes = settings.MAX_EXPANDED_NODES if self._binding else 4
+        if self._binding:
+            for path, data in self._binding.nodes.items():
+                self.node_manager.update_node_summary(path, data["summary"])
+            for path in (self._view or {}).get("expanded", []):
+                if path in self._binding.nodes:
+                    self.node_manager.expand_node(path)
+            for path in (self._view or {}).get("pins", []):
+                if path in self._binding.nodes:
+                    self.node_manager.pin_node(path)
+            for path in self._binding.route.get("expanded_nodes", []):
+                if path in self._binding.nodes and path not in (self._view or {}).get("collapsed", []):
+                    self.node_manager.expand_node(path)
         channel_path = f"channels.{channel.type}.{channel.id}"
         self.node_manager.expand_node(channel_path)
         self.node_manager.pin_node(channel_path)
         sources = {
+            **(self._binding.nodes if self._binding else {}),
             "sources.web": {"description": "Search current public web information with web_search."},
             "sources.pages": {"description": "Read public pages, project docs, or raw GitHub files with read_webpage."},
             "sources.feeds": {"description": "Read news, blogs, or GitHub release RSS/Atom feeds with read_feed."},
@@ -260,7 +352,7 @@ class NodeProcessor:
             self.node_manager.pin_node("channel.memory")
         if self.watch_service and channel.type in {"discord", "matrix"}:
             sources["sources.watches"] = self._watch_node(channel)
-        scope_payload = self.payload_builder.build_request_node_payload(channel, self.node_manager)
+        scope_payload = self.payload_builder.build_request_node_payload(channel, self.node_manager, sources)
         channel_node = scope_payload["expanded_nodes"][channel_path]["data"]
         scope = self.policy.scope_from_payload(scope_payload)
         proactive = getattr(self.executor.action_context, "proactive_source_service", None)
@@ -282,7 +374,7 @@ class NodeProcessor:
                     if data not in saved_watch_results:
                         saved_watch_results.append(data)
             for index, data in enumerate(saved_watch_results, 1):
-                prefix = "sources.proactive_result_" if data["tool"] in PROACTIVE_SOURCE_TOOLS else "sources.watch_result_"
+                prefix = "sources.task_result_" if data["tool"] in TASK_TOOLS else "sources.proactive_result_" if data["tool"] in PROACTIVE_SOURCE_TOOLS else "sources.watch_result_"
                 path = prefix + str(index)
                 sources[path] = data
                 self.node_manager.expand_node(path)
@@ -299,9 +391,12 @@ class NodeProcessor:
                 if turn and not self.research_store.heartbeat(turn["id"], turn["lease_token"], lease_seconds=900):
                     return self._result(executed, lookups, step, failed=True)
                 final_step = force_answer or step == self.MAX_STEPS - 1 or lookups >= self.MAX_LOOKUPS
-                names = allowed - READ_ONLY_SOURCE_TOOLS if final_step else allowed
+                names = allowed - READ_ONLY_SOURCE_TOOLS - TASK_TOOLS if final_step else allowed
                 payload = self.payload_builder.build_request_node_payload(channel, self.node_manager, sources)
                 self.catalog = {channel_path: {}, **sources}
+                if self._binding:
+                    payload["task_route"] = self._binding.route
+                    payload["task"] = self.task_service.task_context(self.awareness_store.get_task(self._binding.task["id"]))
                 payload.update({
                     "cycle_id": cycle_id, "final_step": final_step,
                     "lookup_budget_remaining": self.MAX_LOOKUPS - lookups,
@@ -327,10 +422,14 @@ class NodeProcessor:
                     # collapsed it. Answer composition has one fixed destination.
                     payload["answer_nodes"] = {
                         channel_path: channel_node,
-                        **sources,
+                        **{path: data for path, data in sources.items()
+                           if path != channel_path and (not self._binding or path not in self._binding.nodes
+                           or self.node_manager.get_node_metadata(path).is_expanded)},
                     }
                     self.last_payload = copy.deepcopy(payload)
                     content = await self.ai_engine.compose_reply(payload)
+                    if not content and self._binding and self._binding.issue:
+                        content = "This saved task needs a fresh start. Please ask me to start a new task for this topic."
                     failed = not content
                     if failed and turn and turn["attempts"] < self.research_store.max_attempts:
                         self.research_store.fail(turn["id"], turn["lease_token"], "AI reply needs another attempt", retry_after=10 * turn["attempts"])
@@ -354,7 +453,7 @@ class NodeProcessor:
                 if watch_actions:
                     for action in watch_actions:
                         result = await self.executor._execute_action_and_return_result(action, scope)
-                        prefix = "sources.proactive_result_" if action.action_type in PROACTIVE_SOURCE_TOOLS else "sources.watch_result_"
+                        prefix = "sources.task_result_" if action.action_type in TASK_TOOLS else "sources.proactive_result_" if action.action_type in PROACTIVE_SOURCE_TOOLS else "sources.watch_result_"
                         path = prefix + str(1 + sum(key.startswith(STATE_RESULT_PREFIXES) for key in sources))
                         sources[path] = {"tool": action.action_type, "trust": "untrusted_source", **result}
                         if turn:
@@ -391,7 +490,29 @@ class NodeProcessor:
                             result = {**cached["result"], "cached": True, "fetched_at": cached["fetched_at"], "expires_at": cached["expires_at"]}
                         else:
                             action.parameters = parameters
+                            lookup_attempt = None
+                            if self._binding and action.action_type in {"web_search", "search_social"}:
+                                lookup_attempt = self.awareness_store.reserve_attempt(self._binding.task["id"], 0.02,
+                                    request_key=f"lookup:{source.id}:{time.time_ns()}:{signature}")
                             result = await self.executor._execute_action_and_return_result(action, scope)
+                            if lookup_attempt:
+                                cost = result.get("usage", {}).get("cost")
+                                if cost is None:
+                                    cost = 0 if result.get("http_status") in {400, 401, 402, 403, 404, 413, 422, 429} else lookup_attempt["reserved_usd"]
+                                self.awareness_store.record_result(self._binding.task["id"],
+                                    {"kind": "source_read", "tool": action.action_type, "status": result.get("status"),
+                                     "cost_source": "provider" if result.get("usage", {}).get("cost") is not None else "reserved_bound"},
+                                    attempt_id=lookup_attempt["id"], cost_usd=cost, status="active")
+                            if self._binding and result.get("status") == "success":
+                                shared_source = self.awareness_store.source_result(channel.type, channel.id, source.sender,
+                                    action.action_type, parameters, result)
+                                node_id = shared_source["node_id"]
+                                self._binding.nodes[node_id] = {k: v for k, v in shared_source.items() if k != "node_id"}
+                                self._binding.fresh_nodes.add(node_id)
+                                self._binding.input_versions = self.awareness_store.snapshot_versions(
+                                    channel.type, channel.id, source.sender, {k: v for k, v in self._binding.nodes.items() if v["kind"] != "task"}, event_id=source.id)
+                                self.awareness_store.save_route(self._binding.task["id"], self._binding.route,
+                                    input_versions=self._binding.input_versions)
                             if turn and result.get("status") == "success":
                                 self.research_store.save_source(channel.type, channel.id, action.action_type, parameters, result, ttl_seconds=settings.RESEARCH_SOURCE_TTL_SECONDS)
                         path = f"sources.result_{lookups}"

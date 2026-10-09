@@ -340,11 +340,15 @@ class PayloadBuilder:
             for message in channel.recent_messages[-settings.AI_CONVERSATION_HISTORY_LENGTH:]
         ]
         channel_path = f"channels.{channel.type}.{channel.id}"
-        catalog = {
-            channel_path: {"id": channel.id, "type": channel.type,
-                           "name": channel.name, "recent_messages": messages},
-            **(source_nodes or {}),
-        }
+        sources = dict(source_nodes or {})
+        observed = sources.pop(channel_path, None)
+        current = {"id": channel.id, "type": channel.type,
+                   "name": channel.name, "recent_messages": messages}
+        if observed and observed.get("kind") == "conversation":
+            current["observed_messages"] = observed["data"].get("messages", [])
+            current["awareness_version"] = observed["version"]
+            current["audience"] = observed["audience"]
+        catalog = {channel_path: current, **sources}
         expanded, collapsed = {}, {}
         for path, data in catalog.items():
             metadata = node_manager.get_node_metadata(path)

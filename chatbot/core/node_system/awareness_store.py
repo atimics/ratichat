@@ -358,12 +358,18 @@ class AwarenessStore:
                                  (str(summary)[:1200], content_version, node_id, content_version))
             return {"updated": bool(updated.rowcount), "conflict": not bool(updated.rowcount)}
 
-    def snapshot_versions(self, platform, channel_id, sender_id, nodes):
+    def snapshot_versions(self, platform, channel_id, sender_id, nodes, *, event_id=None):
         """Pin source events so later conversation activity keeps task inputs stable."""
         platform, channel_id, sender_id = self._scope(platform, channel_id, sender_id)
         with self._transaction() as db:
             actor = self._actor(db, platform, sender_id)
             versions = {}
+            if event_id:
+                event = db.execute("SELECT * FROM awareness_messages WHERE platform=? AND channel_id=? AND event_id=? AND deleted=0",
+                    (platform, channel_id, event_id)).fetchone()
+                if not event or self._canonical(db, event["actor_id"]) != actor:
+                    raise PermissionError("Snapshot the current sender's source event")
+                versions["event:" + event["event_key"]] = event["revision"]
             for node_id, value in nodes.items():
                 row = db.execute("SELECT * FROM awareness_nodes WHERE id=? AND valid=1", (node_id,)).fetchone()
                 if not row or row["version"] != value.get("version") or not self._can_read(db, row, platform, channel_id, actor):
@@ -615,7 +621,9 @@ class AwarenessStore:
                 return {"saved": True, "conflict": False, "id": previous["id"], "route": json.loads(previous["data_json"])}
             identity = "route:" + uuid.uuid4().hex
             db.execute("INSERT INTO awareness_routes VALUES(?,?,?,?,?,?)", (identity, task_id, request_key, _json(route), _json(inputs), self.clock()))
-            db.execute("UPDATE awareness_tasks SET route_id=?,input_json=?,status='ready',updated_at=? WHERE id=?", (identity, _json(inputs), self.clock(), task_id))
+            db.execute("UPDATE awareness_tasks SET route_id=?,input_json=?,topic=?,persona_id=?,status='ready',updated_at=? WHERE id=?",
+                (identity, _json(inputs), str(route.get("topic", task["topic"]))[:100],
+                 str(route.get("persona", task["persona_id"]))[:100], self.clock(), task_id))
             self._task_node(db, task_id)
             return {"saved": True, "conflict": False, "id": identity, "route": route}
 

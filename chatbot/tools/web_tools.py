@@ -165,7 +165,12 @@ class WebSearchTool(ToolInterface):
                     },
                 )
                 response.raise_for_status()
-                message = response.json()["choices"][0]["message"]
+                data = response.json()
+                message = data["choices"][0]["message"]
+                cost = data.get("usage", {}).get("cost")
+                receipt = {"model": str(data.get("model", model))[:200], "usage": {}}
+                if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
+                    receipt["usage"]["cost"] = cost
                 sources = []
                 for annotation in message.get("annotations", []):
                     citation = annotation.get("url_citation", {})
@@ -173,12 +178,12 @@ class WebSearchTool(ToolInterface):
                         sources.append({"url": citation["url"], "title": citation.get("title", ""),
                                         "content": citation.get("content", "")[:2000]})
                 if not sources:
-                    return {"status": "failure", "error": "Search returned no verified source links. Try a more specific query."}
+                    return {"status": "failure", "error": "Search returned no verified source links. Try a more specific query.", **receipt}
                 return {"status": "success", "query": query.strip(),
                         "result": (message.get("content") or "")[:MAX_SOURCE_CHARS],
-                        "sources": sources[:3], "timestamp": time.time(), "trust": "untrusted_source"}
+                        "sources": sources[:3], "timestamp": time.time(), "trust": "untrusted_source", **receipt}
         except httpx.HTTPStatusError as error:
-            return {"status": "failure", "error": f"Search service returned HTTP {error.response.status_code}"}
+            return {"status": "failure", "error": f"Search service returned HTTP {error.response.status_code}", "http_status": error.response.status_code}
         except (httpx.HTTPError, KeyError, ValueError, TypeError):
             return {"status": "failure", "error": "Search service needs another attempt"}
 

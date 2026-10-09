@@ -234,3 +234,5 @@ The central acceptance case is: address a research request to the bot in Discord
 continue the task through rati.chat, and receive a result based on the same
 project, people, persona, and task nodes. Each conversation keeps its expanded
 view and reply destination.
+
+The first runtime is described in [Shared awareness runtime](SHARED_AWARENESS_RUNTIME.md).
