@@ -3,7 +3,9 @@
 import asyncio
 import hashlib
 import logging
+import time
 from collections import OrderedDict
+from dataclasses import asdict
 
 import discord
 
@@ -20,6 +22,9 @@ class DiscordObserver(Integration):
         super().__init__("discord", "Discord", {})
         config = config or settings
         self.world_state = world_state_manager
+        self.awareness_store = None
+        self.intake_started_at = time.time()
+        self.message_content_enabled = getattr(config, "DISCORD_MESSAGE_CONTENT_ENABLED", False)
         self.token = config.DISCORD_BOT_TOKEN
         self.allowed_guild_ids = parse_id_allowlist(config.DISCORD_ALLOWED_GUILD_IDS)
         self.allowed_channel_ids = parse_id_allowlist(config.DISCORD_ALLOWED_CHANNEL_IDS)
@@ -52,6 +57,7 @@ class DiscordObserver(Integration):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.guild_messages = True
+        intents.message_content = self.message_content_enabled
         self.client = discord.Client(
             intents=intents, allowed_mentions=discord.AllowedMentions.none(),
             max_messages=100, member_cache_flags=discord.MemberCacheFlags.none(),
@@ -70,6 +76,19 @@ class DiscordObserver(Integration):
         @self.client.event
         async def on_message(message):
             await self._handle_message(message)
+
+        @self.client.event
+        async def on_raw_message_edit(payload):
+            await self._handle_message_edit(payload)
+
+        @self.client.event
+        async def on_raw_message_delete(payload):
+            self._handle_message_delete(payload)
+
+        @self.client.event
+        async def on_raw_bulk_message_delete(payload):
+            for message_id in payload.message_ids:
+                self._delete_observation(payload.guild_id, payload.channel_id, message_id)
 
         @self.client.event
         async def on_error(event, *args, **kwargs):
@@ -132,18 +151,116 @@ class DiscordObserver(Integration):
         request = self._requests.get(str(message_id))
         return bool(request and request[0] == str(channel_id) and str(message_id) not in self._replies)
 
+    def _configured_source(self, guild_id, channel_id):
+        return str(guild_id) in self.allowed_guild_ids and str(channel_id) in self.allowed_channel_ids
+
+    def _record_message(self, message, content, guild_id, channel_id, mentioned):
+        reference = getattr(message, "reference", None)
+        timestamp = message.created_at.timestamp()
+        return Message(
+            id=str(message.id), channel_id=channel_id, channel_type="discord",
+            sender=str(message.author.id), sender_display_name=message.author.display_name,
+            sender_username=message.author.name, content=content, timestamp=timestamp,
+            reply_to=str(reference.message_id) if reference and reference.message_id else None,
+            metadata={"guild_id": guild_id, "bot_mentioned": mentioned,
+                      "raw_content": message.content[:4000],
+                      "historical": bool(getattr(message, "historical", False) or timestamp < self.intake_started_at)},
+        )
+
+    def _save_observation(self, message):
+        if self.awareness_store:
+            try:
+                return self.awareness_store.ingest_message("discord", message.channel_id, asdict(message))
+            except Exception:
+                logger.warning("Discord awareness intake needs another save attempt")
+
+    async def _handle_message_edit(self, payload):
+        if not self._configured_source(payload.guild_id, payload.channel_id):
+            return
+        data = payload.data
+        if not isinstance(data, dict) or not isinstance(data.get("content"), str):
+            return
+        author = data.get("author")
+        message = getattr(payload, "message", None)
+        if not isinstance(author, dict) or not author.get("id"):
+            if not message or not getattr(message, "author", None):
+                return
+            author = {"id": str(message.author.id), "bot": message.author.bot}
+        if author.get("bot") or data.get("webhook_id"):
+            return
+        original = getattr(payload, "cached_message", None)
+        if original and str(original.author.id) != str(author["id"]):
+            return
+        saved_channel = self.world_state.get_channel(str(payload.channel_id))
+        if saved_channel and any(item.id == str(payload.message_id) and item.sender != str(author["id"])
+                                 for item in saved_channel.recent_messages):
+            return
+        edited_at = data.get("edited_timestamp")
+        if isinstance(edited_at, str):
+            from datetime import datetime
+            try:
+                revision = datetime.fromisoformat(edited_at.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return
+        else:
+            stamp = getattr(message, "edited_at", None)
+            if stamp is None:
+                return
+            revision = stamp.timestamp()
+        if self.awareness_store:
+            try:
+                result = self.awareness_store.edit_message("discord", str(payload.channel_id), str(payload.message_id),
+                    {"sender": str(author["id"]), "content": data["content"][:4000],
+                     "source_revision": revision, "metadata": {"edited_at": revision, "raw_content": data["content"][:4000]}})
+                if result.get("changed"):
+                    self._requests.pop(str(payload.message_id), None)
+                    if saved_channel:
+                        for item in saved_channel.recent_messages:
+                            if item.id == str(payload.message_id):
+                                item.content = data["content"][:4000]
+                                item.metadata.update(edited_at=revision, raw_content=item.content)
+            except Exception:
+                logger.warning("Discord message edit needs another save attempt")
+
+    def _delete_observation(self, guild_id, channel_id, message_id):
+        if not self._configured_source(guild_id, channel_id):
+            return
+        self._requests.pop(str(message_id), None)
+        channel = self.world_state.get_channel(str(channel_id))
+        if channel:
+            for item in channel.recent_messages:
+                if item.id == str(message_id):
+                    item.content = ""
+                    item.image_urls = []
+                    item.arweave_media_attachments = []
+                    item.metadata = {"deleted": True, "historical": True}
+        if self.awareness_store:
+            try:
+                self.awareness_store.delete_message("discord", str(channel_id), str(message_id), timestamp=time.time())
+            except Exception:
+                logger.warning("Discord message deletion needs another save attempt")
+
+    def _handle_message_delete(self, payload):
+        self._delete_observation(payload.guild_id, payload.channel_id, payload.message_id)
+
     async def _handle_message(self, message):
         if not self.client or not self.client.user or not message.guild:
             return
         channel_id, guild_id = str(message.channel.id), str(message.guild.id)
-        if guild_id not in self.allowed_guild_ids or channel_id not in self.allowed_channel_ids:
+        if not self._configured_source(guild_id, channel_id):
             return
         if message.author.bot or message.webhook_id:
             return
-        if not any(user.id == self.client.user.id for user in message.mentions):
-            return
         content = message.content.strip()
         message_id = str(message.id)
+        mentioned = any(user.id == self.client.user.id for user in message.mentions)
+        record = self._record_message(message, content[:4000], guild_id, channel_id, mentioned)
+        if content:
+            saved = self._save_observation(record)
+            if isinstance(saved, dict) and saved.get("deleted"):
+                return
+        if not mentioned or record.metadata["historical"]:
+            return
         if not content or len(content) > self.max_message_chars or message_id in self._requests:
             return
         if not self._rate_limiter.allow(f"{channel_id}:{message.author.id}"):
@@ -153,13 +270,7 @@ class DiscordObserver(Integration):
             self._requests.popitem(last=False)
         if not self.world_state.get_channel(channel_id):
             self.world_state.add_channel(channel_id, "discord", message.channel.name)
-        self.world_state.add_message(channel_id, Message(
-            id=message_id, channel_id=channel_id, channel_type="discord",
-            sender=str(message.author.id), sender_display_name=message.author.display_name,
-            sender_username=message.author.name, content=content,
-            timestamp=message.created_at.timestamp(),
-            metadata={"guild_id": guild_id, "bot_mentioned": True, "raw_content": message.content},
-        ))
+        self.world_state.add_message(channel_id, record)
         if self.on_state_change:
             self.on_state_change()
 
