@@ -46,6 +46,7 @@ jobs:
           --config deploy/fly/bot/fly.toml
           --ha=false
           --remote-only
+          --env "RATICHAT_RELEASE_SHA=${{ github.sha }}"
 
       - name: Fix the bot at one Machine
         run: >-
@@ -55,3 +56,9 @@ jobs:
 
       - name: Show final status
         run: flyctl status --app "$FLY_APP_NAME"
+
+      - name: Verify bot readiness
+        run: >-
+          curl --fail --silent --show-error
+          --retry 6 --retry-delay 10 --retry-all-errors --max-time 10
+          "https://${FLY_APP_NAME}.fly.dev/ready"

@@ -7,14 +7,26 @@ from datetime import datetime
 from typing import Dict, Any
 
 from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import JSONResponse
 
 from ..schemas import SystemCommand, StatusResponse
 from chatbot.core.orchestration import MainOrchestrator
 from ..dependencies import get_orchestrator
+from ..readiness import bot_readiness
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/system", tags=["system"])
+
+
+@router.get("/readiness")
+async def get_readiness(orchestrator: MainOrchestrator = Depends(get_orchestrator)):
+    readiness = await bot_readiness(orchestrator)
+    return JSONResponse(
+        readiness,
+        status_code=200 if readiness["status"] == "ready" else 503,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.get("/health")

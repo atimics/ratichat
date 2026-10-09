@@ -18,6 +18,7 @@ from .services import SetupManager, LogWebSocketManager
 from .routers import system, tools, config, integrations, ai, worldstate, setup, logs, ui_frames
 from .schemas import StatusResponse
 from .auth import allowed_origins, configured_admin_token, is_admin_authorized
+from .readiness import bot_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,15 @@ class ChatbotAPIServer:
                 "timestamp": datetime.now().isoformat(),
                 "service": "chatbot_api"
             }
+
+        @self.app.get("/ready")
+        async def root_readiness_check():
+            readiness = await bot_readiness(self.orchestrator)
+            return JSONResponse(
+                {"status": readiness["status"]},
+                status_code=200 if readiness["status"] == "ready" else 503,
+                headers={"Cache-Control": "no-store"},
+            )
         
         # Add compatibility route for legacy /api/status endpoint
         @self.app.get("/api/status")
