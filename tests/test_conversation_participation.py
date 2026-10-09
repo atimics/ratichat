@@ -2,6 +2,7 @@
 
 import json
 import time
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -139,4 +140,25 @@ async def test_jev_failure_keeps_observing_and_records_reserved_cost(tmp_path):
     assert not (await service.evaluate(channel, source))["join"]
     channel, source = event("two")
     assert (await service.evaluate(channel, source))["reason"] == "decision_budget"
+    service.close()
+
+
+@pytest.mark.asyncio
+async def test_decision_sees_later_answers_and_one_current_event(tmp_path):
+    processor, tasks, store, ai, sends = setup(tmp_path)
+    source = message(processor, store, "discord", "general", "peer", "question", "Which version did we agree on?")
+    source.metadata.update(is_bot=True, conversation_candidate=True)
+    saved = Channel(id="general", type="discord", name="general", recent_messages=[source])
+    answer = Message("later-answer", "discord", "ratichat", "We agreed on Python 3.14.", source.timestamp + 1,
+        channel_id="general", metadata={"is_bot": True})
+    store.ingest_message("discord", "general", asdict(answer))
+    decisions = SimpleNamespace(decide=AsyncMock(return_value=receipt("wait")))
+    service = ParticipationService(str(tmp_path / "participation.db"), decisions, store)
+    assert not (await service.evaluate(saved, source))["join"]
+    state = decisions.decide.call_args.args[0]
+    assert len(state["conversation"]) == 1
+    assert state["conversation"][0]["content"] == answer.content
+    assert state["conversation"][0]["timestamp"] > state["event"]["timestamp"]
+    assert state["conversation"][0]["is_ratichat"]
+    assert all(n["id"] != "channels.discord.general" for n in state["shared_context"])
     service.close()
