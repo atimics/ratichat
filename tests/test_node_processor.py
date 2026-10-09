@@ -481,6 +481,33 @@ async def test_watch_change_replay_after_composer_retry_keeps_one_watch(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("name,params", [
+    ("create_source_watch", {"url": "https://example.com/feed"}),
+    ("list_source_watches", {}),
+])
+async def test_watch_result_survives_restart_when_retry_planner_waits(tmp_path, name, params):
+    processor, ai, tools = make_processor(tmp_path, [
+        decision(plan(name, **params)), decision(plan("wait")), decision(plan("wait")),
+    ])
+    wire_watch_tools(processor)
+    processor.research_store.clock = lambda: 1000
+    ai.compose_reply.side_effect = [None, "The saved tool result is ready."]
+    assert (await processor.process_cycle("first", "20"))["failed"]
+    assert processor.research_store.get(1)["sources"][0]["tool"] == name
+    processor.research_store.close()
+    restarted = NodeProcessor(processor.world_state, processor.payload_builder, processor.executor, processor.db_path)
+    restarted.watch_service = processor.watch_service
+    restarted.research_store.clock = lambda: 1011
+    assert not (await restarted.process_cycle("retry", "20"))["failed"]
+    assert ai.make_decision.await_count == 3
+    saved_result = ai.compose_reply.await_args.args[0]["answer_nodes"]["sources.watch_result_1"]
+    assert saved_result["tool"] == name and saved_result["status"] == "success"
+    assert restarted.research_store.state_counts() == {"sent": 1}
+    tools["send_discord_reply"].execute.assert_awaited_once()
+    assert tools["send_discord_reply"].execute.await_args.args[0]["reply_to_id"] == "40"
+
+
+@pytest.mark.asyncio
 async def test_short_watch_text_uses_normal_agent_processing(tmp_path):
     processor, ai, _ = make_processor(tmp_path, [decision(plan("wait"))])
     source = processor.world_state.get_channel("20").recent_messages[-1]

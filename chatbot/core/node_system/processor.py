@@ -255,6 +255,11 @@ class NodeProcessor:
             sources["channel.memory"] = self.research_store.memory_node(channel.type, channel.id)
             self.node_manager.expand_node("channel.memory")
             self.node_manager.pin_node("channel.memory")
+            saved_watch_results = [data for data in turn["sources"] if data.get("tool") in SOURCE_WATCH_TOOLS]
+            for index, data in enumerate(saved_watch_results, 1):
+                path = "sources.watch_result_" + str(index)
+                sources[path] = data
+                self.node_manager.expand_node(path)
         if self.watch_service and channel.type in {"discord", "matrix"}:
             sources["sources.watches"] = self._watch_node(channel)
         scope_payload = self.payload_builder.build_request_node_payload(channel, self.node_manager)
@@ -264,7 +269,8 @@ class NodeProcessor:
         if turn:
             allowed &= READ_ONLY_SOURCE_TOOLS | SOURCE_WATCH_TOOLS | REPLY_TOOLS | MANAGEMENT_TOOLS | {"wait"}
         lookups, executed = 0, 0
-        results = []
+        results = [{"tool": data["tool"], "node_path": path, "result": data}
+                   for path, data in sources.items() if path.startswith("sources.watch_result_")]
         seen_lookups = set()
         force_answer = False
         try:
@@ -329,6 +335,10 @@ class NodeProcessor:
                         result = await self.executor._execute_action_and_return_result(action, scope)
                         path = "sources.watch_result_" + str(1 + sum(key.startswith("sources.watch_result_") for key in sources))
                         sources[path] = {"tool": action.action_type, "trust": "untrusted_source", **result}
+                        if turn:
+                            records = [data for key, data in sources.items() if key.startswith("sources.watch_result_")]
+                            if not self.research_store.save_sources(turn["id"], turn["lease_token"], records):
+                                return self._result(executed, lookups, step + 1, failed=True)
                         self.node_manager.expand_node(path)
                         results.append({"tool": action.action_type, "node_path": path, "result": result})
                         executed += 1

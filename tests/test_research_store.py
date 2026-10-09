@@ -106,6 +106,21 @@ def test_processing_lease_survives_restart_and_fences_stale_worker(tmp_path):
     restored.close()
 
 
+def test_saved_tool_results_survive_retry_and_keep_the_current_lease(saved):
+    store, clock = saved
+    turn = store.enqueue("discord", "general", "one", snapshot())
+    old = store.claim("discord", "general", lease_seconds=10)
+    result = {"tool": "create_source_watch", "status": "success", "watch_id": "abc123"}
+    assert store.save_sources(turn["id"], old["lease_token"], [result])
+    clock.advance(10)
+    current = store.claim("discord", "general")
+    assert current["sources"] == [result]
+    assert not store.save_sources(turn["id"], old["lease_token"], [])
+    assert store.get(turn["id"])["sources"] == [result]
+    assert store.ready(turn["id"], current["lease_token"], "Watch saved", sources=[result])
+    assert not store.save_sources(turn["id"], current["lease_token"], [])
+
+
 def test_two_store_handles_share_one_atomic_claim(tmp_path):
     path = str(tmp_path / "research.db")
     stores = [ResearchStore(path), ResearchStore(path)]

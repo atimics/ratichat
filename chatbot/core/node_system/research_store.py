@@ -220,6 +220,15 @@ class ResearchStore:
 
     complete = finish_without_reply
 
+    def save_sources(self, turn_id: int, lease_token: str, sources: list) -> bool:
+        """Save tool results while the current worker holds the request."""
+        encoded = self._json(sources)
+        now = self.clock()
+        with self._transaction() as db:
+            return bool(db.execute("""UPDATE research_turns SET source_results_json=?,updated_at=?
+                WHERE id=? AND status='running' AND lease_token=? AND lease_until>?""",
+                (encoded, now, turn_id, lease_token, now)).rowcount)
+
     def ready(self, turn_id: int, lease_token: str, reply: str, *, sources: list | None = None) -> bool:
         """Save the finished reply before any delivery starts."""
         reply = str(reply).strip()
