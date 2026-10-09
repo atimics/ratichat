@@ -396,7 +396,7 @@ class NodeProcessor:
                 self.catalog = {channel_path: {}, **sources}
                 if self._binding:
                     payload["task_route"] = self._binding.route
-                    payload["task"] = self.awareness_store.get_task(self._binding.task["id"])
+                    payload["task"] = self.task_service.task_context(self.awareness_store.get_task(self._binding.task["id"]))
                 payload.update({
                     "cycle_id": cycle_id, "final_step": final_step,
                     "lookup_budget_remaining": self.MAX_LOOKUPS - lookups,

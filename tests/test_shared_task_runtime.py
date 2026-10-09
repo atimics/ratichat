@@ -276,3 +276,22 @@ async def test_passive_current_channel_context_keeps_request_authority(tmp_path)
     assert payload["current_request"]["id"] == "d1"
     assert payload["channels"]["general"]["recent_messages"][-1]["sender_id"] == "owner"
     assert sends["send_discord_reply"].call_args.args[0]["reply_to_id"] == "d1"
+
+
+@pytest.mark.asyncio
+async def test_account_confirmation_requires_the_human_message(tmp_path):
+    processor, service, store, ai, sends = setup(tmp_path)
+    link = store.begin_link("discord", "general", "owner", "matrix", "@owner:test")
+    store.prove_link(link["link_id"], link["code"], "matrix", "!public:test", "@owner:test")
+    source = message(processor, store, "discord", "general", "owner", "d1", "What is the weather?")
+    binding = await service.prepare(processor.world_state.get_channel("general"), source)
+    scope = ExecutionScope("general", "discord", frozenset({"d1"}), "d1", "owner")
+    with service.activate(binding):
+        blocked = await service.execute_tool("link_chat_account", {"stage": "confirm", "link_id": link["link_id"]}, scope)
+    assert blocked["status"] == "blocked"
+    source = message(processor, store, "discord", "general", "owner", "d2", "Confirm link " + link["link_id"])
+    binding = await service.prepare(processor.world_state.get_channel("general"), source)
+    scope = ExecutionScope("general", "discord", frozenset({"d2"}), "d2", "owner")
+    with service.activate(binding):
+        result = await service.execute_tool("link_chat_account", {"stage": "confirm", "link_id": link["link_id"]}, scope)
+    assert result["stage"] == "complete"

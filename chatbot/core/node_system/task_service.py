@@ -37,6 +37,7 @@ class TaskBinding:
     input_versions: dict = field(default_factory=dict)
     fresh_nodes: set = field(default_factory=set)
     issue: str = ""
+    request_text: str = ""
 
 
 class TaskService:
@@ -61,7 +62,7 @@ class TaskService:
                 route = task.get("route") or route
             self.store.save_route(task["id"], route, input_versions=self.store.snapshot_versions(channel.type, channel.id, source.sender, {k: v for k, v in nodes.items() if v["kind"] != "task"}))
         return TaskBinding(self, task, channel.type, channel.id, source.sender, source.id,
-            copy.deepcopy(nodes), route, input_versions=self.store.snapshot_versions(channel.type, channel.id, source.sender, {k: v for k, v in nodes.items() if v["kind"] != "task"}))
+            copy.deepcopy(nodes), route, input_versions=self.store.snapshot_versions(channel.type, channel.id, source.sender, {k: v for k, v in nodes.items() if v["kind"] != "task"}), request_text=source.content)
 
     async def _route(self, task, state, nodes, tasks=(), preferred_models=None):
         attempt = self.store.reserve_attempt(task["id"], 0.001,
@@ -124,6 +125,18 @@ class TaskService:
             attempt_id=attempt["id"], cost_usd=attempt["reserved_usd"] if uncertain else 0,
             input_versions=attempt["input_versions"], success=False, status="active")
 
+    @staticmethod
+    def task_context(task, *, history=True):
+        fields = ("id", "goal", "topic", "persona_id", "status", "root_task_id", "budget_usd", "spent_usd", "reserved_usd", "remaining_usd")
+        result = {k: task[k] for k in fields if k in task}
+        result["goal"] = str(result.get("goal", ""))[:1500 if history else 300]
+        route = task.get("route") or {}
+        result["route"] = {k: route[k] for k in ("model", "persona", "topic", "catalog_version") if k in route}
+        if history:
+            result["results"] = [{"status": item["status"], "result": json.dumps(item["result"])[:1800]}
+                                 for item in task.get("results", [])[-3:]]
+        return result
+
     async def execute_tool(self, name, params, scope):
         binding = ACTIVE_TASK.get()
         if not binding or (binding.platform, binding.channel_id, binding.sender_id, binding.event_id) != (
@@ -140,10 +153,19 @@ class TaskService:
                 return {"status": "success", "catalog_version": self.router.catalog_version,
                         "matching_models": len(models), "models": models[:limit]}
             if name == "get_task_status":
-                return {"status": "success", "task": self.store.get_task(binding.task["id"]),
-                        "tasks": self.store.list_tasks(binding.platform, binding.channel_id, binding.sender_id)}
+                return {"status": "success", "task": self.task_context(self.store.get_task(binding.task["id"])),
+                        "tasks": [self.task_context(t, history=False) for t in
+                            self.store.list_tasks(binding.platform, binding.channel_id, binding.sender_id)[:10]]}
             if name == "link_chat_account":
                 stage = params.get("stage")
+                text = binding.request_text
+                link_id, code = str(params.get("link_id", "")), str(params.get("code", ""))
+                if stage == "start" and ("link" not in text.lower() or not params.get("target_account_id") or params["target_account_id"] not in text):
+                    raise ValueError("Ask to link the exact target account ID in your message.")
+                if stage == "prove" and (not link_id or not code or link_id not in text or code not in text):
+                    raise ValueError("Include the link ID and proof code in your message from the target account.")
+                if stage == "confirm" and ("confirm" not in text.lower() or not link_id or link_id not in text):
+                    raise ValueError("Confirm the exact link ID in a message from the original account.")
                 identity = (binding.platform, binding.channel_id, binding.sender_id)
                 if stage == "start":
                     return {"status": "success", **self.store.begin_link(*identity,

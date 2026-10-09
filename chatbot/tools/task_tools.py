@@ -28,7 +28,7 @@ class RunTaskWorkersTool(TaskTool):
 
 class LinkChatAccountTool(TaskTool):
     name = "link_chat_account"
-    description = "Link your Discord and Matrix accounts when you ask. Start with the exact target account ID. Prove the code from that target account, then confirm from the original account. Each step uses the actual sender."
+    description = "Link your Discord and Matrix accounts when you ask. Include the exact target account ID in the start request. Present the link ID and code in a message from that target account, then confirm the exact link ID in a message from the original account. Each step uses the actual sender."
     parameters_schema = {"stage": "string - start, prove, or confirm",
                          "target_platform": "string - discord or matrix for start",
                          "target_account_id": "string - Exact target platform account ID for start",
