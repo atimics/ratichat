@@ -21,7 +21,9 @@ CosyWorld's live main was checked with `git ls-remote` and is
 | rati.chat uses Element Web over the Matrix homeserver. The client and bot have separate Fly apps. | [Element config](../deploy/matrix/element-web/config.json), [deployment guide](../deploy/matrix/README.md) |
 | The active request catalog contains the current channel and its source nodes. | [PayloadBuilder](../chatbot/core/world_state/payload_builder.py), line 332 |
 | Each request clears node metadata before opening its channel and saved channel memory. | [NodeProcessor](../chatbot/core/node_system/processor.py), line 245 |
-| Saved memory and source caches use platform and channel keys. The memory node includes up to five settled turns within 6,000 characters. | [ResearchStore](../chatbot/core/node_system/research_store.py), lines 346 and 382 |
+| Saved memory and source caches use platform and channel keys. The memory node includes up to five confirmed sent turns within 6,000 characters, with seven-day retention. | [ResearchStore](../chatbot/core/node_system/research_store.py), lines 346 and 382; [settings](../chatbot/config.py), line 82 |
+| Discord intake records bot mentions. Matrix observes messages in its approved rooms. | [Discord observer](../chatbot/integrations/discord/observer.py), line 135; [Matrix observer](../chatbot/integrations/matrix/observer.py), line 381 |
+| Discord and Matrix use saved turns. Farcaster follows the direct cycle path. | [NodeProcessor](../chatbot/core/node_system/processor.py), line 123 |
 | World state starts empty. User memories, knowledge, and development tasks also have in-memory maps. | [WorldStateManager](../chatbot/core/world_state/manager.py), [structures](../chatbot/core/world_state/structures.py) |
 | Planning, final replies, and proactive writing use one configured model. | [AIDecisionEngine](../chatbot/core/ai_engine.py), lines 47, 601, 780, and 807 |
 | Proactive writing receives a public source node through its own composition path. | [ProactiveSourceService](../chatbot/core/node_system/proactive_sources.py), line 355 |
@@ -52,7 +54,7 @@ Persist these records:
 
 | Record | Contents |
 | --- | --- |
-| Events | Stable ID, source platform, channel, sender, timestamp, type, content, audience, and receipt |
+| Events | Stable ID, source platform, channel, sender, timestamp, type, content, audience, and receipt; unique platform/channel/source-event key; saved edit and deletion events |
 | People | Stable internal actor ID, verified platform account links, preferences, and evidence |
 | Nodes | Stable ID, kind, content, summary, content version, summary version, audience, evidence references, and update time |
 | Views | View ID, current conversation, expanded nodes, collapsed nodes, pins, and context budget |
@@ -65,9 +67,17 @@ conversation. Save view changes under the view ID so simultaneous requests
 keep independent attention choices.
 
 At ingestion, save the event and update its node projection in one transaction.
+Record permitted room and channel messages as observations across the adapters.
+An addressed request or scheduled task starts the decision path. This separates
+shared awareness intake from the choice to speak. Batch summary updates under
+the existing task budget.
 At boot, load the latest projection and continue from the saved event position.
 Generate a summary for a specific content version. Publish it while that version
 is current. Collapsed nodes retain their summary and evidence links.
+Source edits and deletions update the evidence record and affected derived
+facts. Refresh related summaries and task inputs from the new versions. Raw
+event retention and lasting knowledge should have explicit policies. The
+current seven-day turn retention is the starting raw-history policy.
 
 Keep source, audience, and reader permissions on every node. Build the allowed
 catalog for the current actor and destination before choosing expansions.
@@ -101,8 +111,9 @@ For RatiChat, ask in stages:
    questions for expansions.
 2. Expand those nodes. Build worker candidates for the task's capabilities,
    context size, deadline, persona preferences, and remaining budget.
-3. Ask Jev for the worker model and supported effort. Save the route and input
-   node versions before calling the worker.
+3. Ask Jev for a complete worker route profile with a model and supported
+   effort, settings, and API path. Save that route and input node versions
+   before calling the worker.
 4. Run the saved route. Save its result as shared nodes and update the task.
 5. Choose whether a completed result merits a reply or proactive post. Compose
    it from the shared nodes and persona, then use the saved delivery path.
@@ -188,9 +199,9 @@ headlines. It offered Haiku, Luna, and Sol as choices.
 - Serving model: `typesafe/jev-1.13-20260917`; provider: TypeSafe.
 - Selected worker: `anthropic/claude-haiku-5.5`.
 - Probabilities: Haiku 0.63, Luna 0.37, Sol 0.
-- Confidence: 0.45; additional research score: 0.09.
+- Confidence: 0.45; probability that more research is needed: 0.09.
 - Usage: 669 input tokens, 62 output tokens, $0.000028098.
-- Choice, probability bounds, probability sum, and score passed checks.
+- Choice, probability bounds, probability sum, and answer types passed checks.
 
 This confirms the linked account's decision path and response shape. It is one
 synthetic connection check. Worker quality and latency need task examples.
@@ -203,7 +214,9 @@ remaining budget.
 1. **Shared store and catalog.** Add events, durable nodes, identity links,
    versioned summaries, and saved views. Connect intake and confirmed outcomes
    to the store. Let every platform expand the same allowed nodes. Check a
-   Discord project discussion, a restart, and a follow-up through rati.chat.
+   project request addressed to the bot in Discord, a restart, and a follow-up
+   through rati.chat. Also check shared facts from permitted observations,
+   event replay, and source corrections.
 2. **Jev and task routing.** Add a compact decision client, catalog snapshots,
    saved task routes, model-aware request builders, and route recovery. Check
    valid choices, timeout fallback, cost accounting, and workers with the
@@ -217,8 +230,7 @@ channel authority for actions. Charge retries and child tasks to the saved
 task budget. Accept result updates against their input node versions so newer
 facts receive a clear follow-up attempt.
 
-The central acceptance case is: start research in Discord, restart the bot,
+The central acceptance case is: address a research request to the bot in Discord, restart the bot,
 continue the task through rati.chat, and receive a result based on the same
 project, people, persona, and task nodes. Each conversation keeps its expanded
 view and reply destination.
-
