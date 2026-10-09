@@ -10,7 +10,7 @@ from copy import copy
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -377,9 +377,17 @@ class MainOrchestrator:
         from ..node_system.research_store import ResearchStore
         from ..node_system.processor import capture_request
         self.research_store = ResearchStore(self.config.db_path, retention_days=settings.RESEARCH_RETENTION_DAYS)
-        self.world_state.on_message_added = lambda channel_id, message: capture_request(
-            self.world_state, self.capability_policy, self.research_store, channel_id, message,
-        )
+        from ..node_system.awareness_store import AwarenessStore
+        approved = {"discord": self.capability_policy.approved_discord_channel_ids,
+                    "matrix": self.capability_policy.approved_matrix_room_ids}
+        self.awareness_store = AwarenessStore(self.config.db_path, allowed_channels=approved,
+            community_channels=approved) if settings.SHARED_AWARENESS_ENABLED else None
+        def intake(channel_id, message):
+            channel = self.world_state.get_channel(channel_id)
+            if self.awareness_store and channel and channel_id in approved.get(channel.type, ()):
+                self.awareness_store.ingest_message(channel.type, channel_id, asdict(message))
+            capture_request(self.world_state, self.capability_policy, self.research_store, channel_id, message)
+        self.world_state.on_message_added = intake
         self.payload_builder = PayloadBuilder()
         self.rate_limiter = RateLimiter(self.config.rate_limit_config)
         self.context_manager = ContextManager(self.world_state, self.config.db_path)
@@ -449,6 +457,13 @@ class MainOrchestrator:
             arweave_service=arweave_service_instance
         )
         self.action_context.ai_engine = self.ai_engine
+        from ..model_router import ModelRouter
+        from ..node_system.task_service import TaskService
+        self.model_router = ModelRouter(lambda: self.ai_engine.api_key,
+            catalog_path=str(Path(self.config.db_path).with_suffix(".models.json"))) if settings.TASK_MODEL_ROUTING_ENABLED else None
+        self.task_service = TaskService(self.awareness_store, self.model_router, self.ai_engine) if self.awareness_store and self.model_router else None
+        self.action_context.task_service = self.task_service
+        self.action_context.awareness_store = self.awareness_store
         from ...integrations.matrix.steward import MatrixSteward
         self.matrix_steward = MatrixSteward(settings, self.config.db_path)
         self.action_context.matrix_steward = self.matrix_steward
@@ -557,6 +572,11 @@ class MainOrchestrator:
         self.tool_registry.register_tool(WebSearchTool())
         self.tool_registry.register_tool(ReadWebpageTool())
         self.tool_registry.register_tool(ReadFeedTool())
+        from ...tools.task_tools import GetTaskStatusTool, RunTaskWorkersTool, LinkChatAccountTool
+        if self.task_service:
+            self.tool_registry.register_tool(GetTaskStatusTool())
+            self.tool_registry.register_tool(RunTaskWorkersTool())
+            self.tool_registry.register_tool(LinkChatAccountTool())
         from ...tools.public_source_tools import ListPublicSourcesTool, ReadNewsTool, SearchSocialTool, ReadBlueskyFeedTool
         from ...tools.proactive_source_tools import ConfigureProactiveTool, GetProactiveStatusTool
         for tool in (ListPublicSourcesTool(), ReadNewsTool(), SearchSocialTool(), ReadBlueskyFeedTool(), ConfigureProactiveTool(), GetProactiveStatusTool()):
@@ -766,7 +786,8 @@ class MainOrchestrator:
         from ..node_system.processor import NodeProcessor
         node_processor = NodeProcessor(
             self.world_state, self.payload_builder, traditional_processor, self.config.db_path,
-            research_store=self.research_store,
+            research_store=self.research_store, awareness_store=self.awareness_store,
+            task_service=self.task_service,
         )
         from ..node_system.source_watches import WatchStore, SourceWatchService
         from ..node_system.watch_delivery import WatchDelivery
@@ -861,6 +882,7 @@ class MainOrchestrator:
         if matrix_auth_is_configured(settings):
             try:
                 self.matrix_observer = MatrixObserver(self.world_state, self.arweave_client)
+                self.matrix_observer.awareness_store = self.awareness_store
                 room_id = settings.MATRIX_ROOM_ID
                 self.matrix_observer.add_channel(room_id, "Robot Laboratory")
                 await self.matrix_observer.start()
@@ -930,6 +952,7 @@ class MainOrchestrator:
         if settings.DISCORD_BOT_TOKEN:
             try:
                 self.discord_observer = DiscordObserver(self.world_state)
+                self.discord_observer.awareness_store = self.awareness_store
                 self.discord_observer.on_state_change = self.processing_hub.trigger_state_change
                 await self.discord_observer.start()
                 logger.info("Discord observer initialized and started")

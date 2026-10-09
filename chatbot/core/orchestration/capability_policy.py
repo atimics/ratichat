@@ -11,7 +11,8 @@ SOURCE_WATCH_TOOLS = WATCH_READ_TOOLS | WATCH_WRITE_TOOLS
 PROACTIVE_READ_TOOLS = frozenset({"get_proactive_status"})
 PROACTIVE_WRITE_TOOLS = frozenset({"configure_proactive"})
 PROACTIVE_SOURCE_TOOLS = PROACTIVE_READ_TOOLS | PROACTIVE_WRITE_TOOLS
-STATE_TOOLS = SOURCE_WATCH_TOOLS | PROACTIVE_SOURCE_TOOLS
+TASK_TOOLS = frozenset({"get_task_status", "run_task_workers", "link_chat_account"})
+STATE_TOOLS = SOURCE_WATCH_TOOLS | PROACTIVE_SOURCE_TOOLS | TASK_TOOLS
 
 PUBLIC_BOT_ALLOWED_TOOLS = READ_ONLY_SOURCE_TOOLS | STATE_TOOLS | frozenset(
     {
@@ -176,7 +177,7 @@ class CapabilityPolicy:
                 return "Use a configured Discord channel for proactive speaking"
             if tool_name in WATCH_WRITE_TOOLS | PROACTIVE_WRITE_TOOLS and not self._watch_owner_scope(execution_scope):
                 return "The bot owner can change watch and proactive settings"
-            if set(parameters) & {"channel_id", "channel_type", "sender_id", "event_id", "source_event_id", "is_owner"}:
+            if set(parameters) & {"channel_id", "channel_type", "sender_id", "event_id", "source_event_id", "is_owner", "domain", "model", "budget_usd", "root_task_id", "task_id"}:
                 return "Use the sender and channel from the current request"
             return None
         if execution_scope and execution_scope.channel_type == "discord" and tool_name not in ({"wait", "send_discord_reply"} | READ_ONLY_SOURCE_TOOLS):

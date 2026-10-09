@@ -331,6 +331,7 @@ class ProactiveSourceService:
                     if post["status"] == "unknown":
                         result = await asyncio.wait_for(self.delivery.reconcile("proactive", "discord", post["channel_id"], post["text"], "proactive:" + post["id"]), self.callback_timeout)
                         self.store.reconcile(post, result)
+                        self._remember_post(post, result)
                         continue
                     claimed = self.store.claim_delivery(post)
                     if claimed:
@@ -342,6 +343,7 @@ class ProactiveSourceService:
                         except Exception:
                             result = {"status": "unknown"}
                         self.store.record_delivery(claimed, result)
+                        self._remember_post(post, result)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -351,12 +353,49 @@ class ProactiveSourceService:
             claim = self.store.claim()
             if claim:
                 try:
-                    items = self.store.fresh_items(claim["channel_id"], await asyncio.wait_for(self.fetch(claim["topic"]), 60))
-                    draft = await self.ai_engine.compose_proactive({"processing_mode": "node_based", "topics": json.loads(claim["topics_json"]),
-                        "expanded_nodes": {"sources.public": {"trust": "untrusted_source", "topic": claim["topic"], "items": items}},
-                        "fetched_at": self.store.now()}) if items else None
+                    service = getattr(self.action_context, "task_service", None)
+                    binding = None
+                    if service:
+                        from ..world_state.structures import Channel, Message
+                        event_id = f"proactive:{claim['channel_id']}:{claim['generation']}:{claim['day']}:{claim['cursor']}"
+                        channel = Channel(id=claim["channel_id"], type="discord", name="community")
+                        source = Message(id=event_id, channel_type="discord", sender="ratichat",
+                            content=f"Choose a useful {claim['topic']} story for this community.", timestamp=self.store.now())
+                        binding = await service.prepare(channel, source, proactive=True)
+                    items, draft = await self._compose(claim, binding, service)
                     self.store.finish(claim, items, draft)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     self.store.finish(claim, [], None)
+
+    async def _compose(self, claim, binding, service):
+        from contextlib import nullcontext
+        with service.activate(binding) if binding else nullcontext():
+            attempt = None
+            if binding and claim["topic"] in {"ai", "reddit", "social"}:
+                attempt = service.store.reserve_attempt(binding.task["id"], 0.01,
+                    request_key="proactive-source:" + binding.event_id, input_versions=binding.input_versions)
+                if not attempt.get("reserved"):
+                    raise ValueError("Use a fresh proactive source snapshot")
+            items = self.store.fresh_items(claim["channel_id"], await asyncio.wait_for(self.fetch(claim["topic"]), 60))
+            if attempt:
+                service.store.record_result(binding.task["id"], {"kind": "source_read", "topic": claim["topic"]},
+                    attempt_id=attempt["id"], cost_usd=attempt["reserved_usd"], status="active")
+            payload = {"processing_mode": "node_based", "topics": json.loads(claim["topics_json"]),
+                "expanded_nodes": {"sources.public": {"trust": "untrusted_source", "topic": claim["topic"], "items": items}},
+                "fetched_at": self.store.now()}
+            if binding:
+                payload["task_route"] = binding.route
+                payload["community_nodes"] = {k: v for k, v in binding.nodes.items()
+                    if k in binding.route.get("expanded_nodes", [])}
+                payload["current_processing_channel_id"] = claim["channel_id"]
+                payload["community"] = {"platform": "discord", "channel_id": claim["channel_id"]}
+            return items, await self.ai_engine.compose_proactive(payload) if items else None
+
+    def _remember_post(self, post, result):
+        store = getattr(self.action_context, "awareness_store", None)
+        if store and result.get("status") == "success" and result.get("message_id"):
+            store.ingest_message("discord", post["channel_id"], {"id": result["message_id"],
+                "sender": "ratichat", "content": post["text"], "timestamp": self.store.now(),
+                "metadata": {"is_bot": True, "confirmed": True, "proactive": True}})
