@@ -240,7 +240,7 @@ async def test_workers_read_fresh_sources_and_only_expanded_details(tmp_path):
 async def test_worker_keeps_full_addresses_and_reads_live_sources_in_its_own_scope(tmp_path):
     processor, service, store, ai, sends = setup(tmp_path)
     addresses = ["0x" + str(i) * 40 for i in range(8)]
-    text = "Review this alert " + "context " * 200 + " ".join(addresses)
+    text = "Review this alert " + "context " * 300 + " ".join(addresses)
     source = message(processor, store, "discord", "general", "owner", "d1", text)
     binding = await service.prepare(processor.world_state.get_channel("general"), source)
     live = AsyncMock(return_value={"status": "success", "usage": {"cost": 0.003}, "sources": [{"url": "https://example.com", "content": "LIVE RECORD"}]})
@@ -251,6 +251,7 @@ async def test_worker_keeps_full_addresses_and_reads_live_sources_in_its_own_sco
     await service._worker(binding, {"goal": "Verify the alert"}, 0)
     payload = ai.compose_task_worker.call_args.args[0]
     assert all(a in payload["original_request"] for a in addresses)
+    assert all(a in payload["original_task_goal"] for a in addresses)
     assert "LIVE RECORD" in json.dumps(payload["tool_results"])
     scope = live.call_args.args[1].execution_scope
     assert scope.latest_event_id == "d1" and scope.channel_id == "general"
@@ -271,6 +272,29 @@ async def test_worker_read_scope_rejects_monitor_writes(tmp_path):
     await service._worker(binding, {"goal": "Research"}, 0)
     write.assert_not_awaited()
     assert ai.compose_task_worker.call_args.args[0]["tool_results"][0]["status"] == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_monitor_creation_is_confirmed_from_saved_result_and_recovered_on_retry(tmp_path):
+    from chatbot.core.node_system.live_monitors import LiveMonitorService, MonitorStore
+    from chatbot.tools.live_monitor_tools import CreateLiveMonitorTool
+    processor, service, store, ai, sends = setup(tmp_path)
+    processor.policy.discord_owner_user_ids = frozenset({"owner"})
+    monitor_store = MonitorStore(str(tmp_path / "shared.db"), owner_ids={"discord": ["owner"]}, allowed_channels=ALLOWED)
+    processor.executor.action_context.live_monitor_service = LiveMonitorService(monitor_store)
+    processor.executor.tool_registry.register_tool(CreateLiveMonitorTool())
+    targets = [{"address": "0x" + "a" * 40, "network": "ethereum"}]
+    message(processor, store, "discord", "general", "owner", "d1", "Watch this address " + targets[0]["address"] + " and keep me updated")
+    ai.make_decision.side_effect = [DecisionResult([ActionPlan("create_live_monitor", {"targets": targets}, "Watch", 1)], "", "", "test"), DecisionResult([], "", "", "test")]
+    result = await processor.process_cycle("monitor", "general")
+    assert not result["failed"]
+    payload = ai.compose_reply.call_args.args[0]
+    saved = [r for r in payload["tool_results"] if r["tool"] == "create_live_monitor"]
+    assert len(saved) == 1 and saved[0]["result"]["status"] == "success"
+    identity = saved[0]["result"]["monitor"]["monitor_id"]
+    assert identity in json.dumps(payload["answer_nodes"])
+    assert len(monitor_store.list({"channel_type": "discord", "channel_id": "general"})) == 1
+    assert sends["send_discord_reply"].call_args.args[0]["reply_to_id"] == "d1"
 
 
 @pytest.mark.asyncio

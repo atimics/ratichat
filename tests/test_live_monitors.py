@@ -206,6 +206,26 @@ def test_stale_lease_and_stopped_monitor_cannot_prepare_delivery(tmp_path):
     assert store.save_check(claimed, snapshot([event(1)])) is None
 
 
+def test_page_limit_retains_last_complete_checkpoint_and_visible_gap(tmp_path):
+    clock = [1000]
+    store = store_at(str(tmp_path / "monitor.db"), clock)
+    create(store)
+    first = store.claim()
+    store.save_check(first, snapshot([event(1)]))
+    clock[0] += 301
+    second = store.claim()
+    prepared = store.save_check(second, snapshot([event(2)], status="limited"))
+    store.reconcile_delivery(prepared["delivery_key"], "success", "receipt")
+    saved = json.loads(store.list(SCOPE)[0]["check_state"])
+    assert next(iter(saved.values()))["keys"] == [event(1)["key"]]
+    clock[0] += 301
+    third = store.claim()
+    limited = snapshot([event(2)], status="limited")
+    limited["streams"][0]["coverage"] = "Read limit reached"
+    prepared = store.save_check(third, limited)
+    assert "Read limit reached" in prepared["pending_text"]
+
+
 @pytest.mark.asyncio
 async def test_owner_and_fixed_destination_are_required_for_monitor_changes(tmp_path):
     store = store_at(str(tmp_path / "monitor.db"), [1000])

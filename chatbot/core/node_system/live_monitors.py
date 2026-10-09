@@ -97,7 +97,9 @@ class MonitorStore(WatchStore):
                 if good:
                     (active_keys if prior.get("baseline") else baseline_keys).update(keys)
                 state[identity] = {**{k: v for k, v in stream.items() if k != "events"},
-                    "keys": keys if good else prior.get("keys", []),
+                    # Keep the last complete checkpoint when a busy stream hits
+                    # the page limit. Later polls must retain the visible gap.
+                    "keys": prior.get("keys", []) if status == "error" or (status == "limited" and prior.get("baseline")) else keys,
                     "baseline": good or prior.get("baseline", False), "failures": failures, "reported": reported,
                     "last_success_at": now if good else prior.get("last_success_at")}
             db.executemany("INSERT OR IGNORE INTO source_watch_items VALUES (?,?)", [(watch["id"], key) for key in baseline_keys])
