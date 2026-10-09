@@ -13,15 +13,30 @@ room tools, dedicated server session, and daily database backups.
 - The Machine stays active. Fly Proxy auto-stop is off.
 - Fly restarts the Machine after a failed process exit, with up to 10 retries.
 - Fly sends `SIGTERM` and gives the process 30 seconds to close.
-- A TCP check confirms that the API process accepts connections on port 8000.
+- HTTP checks report API reachability and bot readiness on port 8000.
 - The SQLite database, Telegram cursor and queue, and Matrix device store use
   the volume.
 - `/app/matrix_token.json` points to `/data/matrix_token.json` so the verified
   Matrix session survives process and Machine restarts.
 
-The public `/health` route reports API reachability. The TCP check uses the
-same narrow readiness claim. Matrix and Farcaster dependency checks can be
-added when the runtime exposes them.
+The public `/health` route reports API reachability. `/ready` returns HTTP 200
+when the bot's processing loop, AI key, configured chat connections, and
+background tasks are ready. It returns HTTP 503 when a check needs attention.
+Fly gives the bot two minutes for startup before checking readiness.
+Fly records readiness as a top-level check. API reachability controls request
+routing, so the management API and OpenRouter connection page stay available
+while an operator fixes a chat connection. See the
+[Fly health check guide](https://fly.io/docs/reference/health-checks/).
+
+The authenticated `/api/system/readiness` route reports each check as a boolean.
+It covers Matrix sync, Discord connection, source watches, live monitoring,
+proactive sources, and scheduled Matrix backups when enabled. These checks
+read local runtime state. Use an actual chat reply and a scheduled monitor
+update to verify provider access and message delivery.
+
+The deployment workflow records `RATICHAT_RELEASE_SHA` and checks public
+readiness after deploying. Run `curl --fail https://ratichat-bot-prod.fly.dev/ready`
+for a quick live check.
 
 ## Farcaster mode
 
@@ -142,7 +157,7 @@ After the first deploy, confirm these items in Fly:
 - The `app` process group has one running Machine in `sjc`.
 - The Machine has 1 GB of memory.
 - `ratichat_bot_data` is 3 GB and attached at `/data`.
-- The TCP service check passes.
+- The API health check and bot readiness check pass.
 - The logs show configured-token verification and Matrix sync.
 - `/app/matrix_token.json` resolves to the file on `/data`.
 - The Farcaster signer value is absent from the running process.

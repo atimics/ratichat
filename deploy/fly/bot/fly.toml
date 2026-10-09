@@ -55,10 +55,22 @@ kill_timeout = 30
     port = 443
     handlers = ["tls", "http"]
 
-  [[services.tcp_checks]]
+  [[services.http_checks]]
+    method = "GET"
+    path = "/health"
     grace_period = "60s"
     interval = "30s"
     timeout = "5s"
+
+[checks.bot_readiness]
+  type = "http"
+  port = 8000
+  method = "GET"
+  path = "/ready"
+  grace_period = "120s"
+  interval = "30s"
+  timeout = "5s"
+  processes = ["app"]
 
 [[vm]]
   size = "shared-cpu-1x"
