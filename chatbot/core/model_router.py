@@ -406,11 +406,12 @@ class ModelRouter:
             "topic": {"type": "choice", "instructions": "Choose the topic of the current task.",
                       "criteria": topic_choices},
         }
+        continuations = [item for item in task_records if not item.get("is_placeholder")]
         task_choices = {"new": None}
-        if task_records:
-            task_choices.update({"task" + str(index): item["id"] for index, item in enumerate(task_records)})
-            questions["task"] = {"type": "choice", "instructions": "Does the current request continue an allowed saved task? Choose new for a separate goal. Account links and audiences were checked by the caller.",
-                                 "criteria": {"new": "Start a new task", **{"task" + str(index): _compact(item) for index, item in enumerate(task_records)}}}
+        if continuations:
+            task_choices.update({"task" + str(index): item["id"] for index, item in enumerate(continuations)})
+            questions["task"] = {"type": "choice", "instructions": "Does the current request continue an allowed saved task? Resume the saved task when the user follows up on its project or goal across chat platforms. Choose new for a separate goal. Account links and audiences were checked by the caller.",
+                                 "criteria": {"new": "Start a separate task", **{"task" + str(index): _compact(item) for index, item in enumerate(continuations)}}}
         for index, node in enumerate(node_records):
             questions["node" + str(index)] = {"type": "noul", "instructions": "Is this node useful to the current request and should its full content be expanded? Node " + node["id"] + ": " + str(node.get("summary", ""))[:500]}
         decision_state = {"request": _compact(state), "current_task_id": current_task_id,
@@ -421,7 +422,7 @@ class ModelRouter:
             answers = receipt["answers"]
             route = dict(route_choices[answers["route"]["choice"]])
             topic = topic_choices[answers["topic"]["choice"]]
-            resume = task_choices[answers["task"]["choice"]] if task_records else None
+            resume = task_choices[answers["task"]["choice"]] if continuations else None
             expanded = [node["id"] for index, node in enumerate(node_records) if answers["node" + str(index)]["noul"] >= 0.6]
         except (httpx.HTTPError, asyncio.TimeoutError, RoutingError, ValueError):
             # An unavailable decision service still has a known exact worker profile.

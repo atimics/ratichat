@@ -313,3 +313,36 @@ async def test_chat_activity_during_routing_preserves_original_event_evidence(tm
     assert saved["accepted"]
     store.delete_message("discord", "general", "d1")
     assert store.get_task(binding.task["id"])["status"] == "needs_refresh"
+
+
+@pytest.mark.asyncio
+async def test_exact_task_reference_resumes_saved_route_during_jev_outage(tmp_path):
+    processor, service, store, ai, sends = setup(tmp_path)
+    source = message(processor, store, "discord", "general", "owner", "d1", "Research the Python project")
+    binding = await service.prepare(processor.world_state.get_channel("general"), source)
+    source = message(processor, store, "matrix", "!public:test", "@owner:test", "$m1", "Continue " + binding.task["id"])
+    service.router.select_route = AsyncMock(side_effect=AssertionError("Saved exact route handles this continuation"))
+    continued = await service.prepare(processor.world_state.get_channel("!public:test"), source)
+    assert continued.task["id"] == binding.task["id"]
+    assert continued.route == binding.route
+    service.router.select_route.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_jev_continuation_choices_include_saved_work_and_skip_placeholder(tmp_path):
+    from tests.test_model_router import catalog, answer_body
+    processor, service, store, ai, sends = setup(tmp_path)
+    source = message(processor, store, "discord", "general", "owner", "d1", "Research Python")
+    first = await service.prepare(processor.world_state.get_channel("general"), source)
+    source = message(processor, store, "matrix", "!public:test", "@owner:test", "$m1", "Continue the Python project")
+    def respond(request):
+        body = json.loads(request.content)
+        choices = body["questions"]["task"]["criteria"]
+        saved = [value for key, value in choices.items() if key != "new"]
+        assert [value["id"] for value in saved] == [first.task["id"]]
+        assert body["session_id"] != first.task["id"]
+        return httpx.Response(200, json=answer_body(request, task="task0"))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        service.router = ModelRouter("key", client=client, catalog=catalog())
+        continued = await service.prepare(processor.world_state.get_channel("!public:test"), source)
+    assert continued.task["id"] == first.task["id"]
