@@ -55,7 +55,7 @@ class SendMatrixReplyTool(ToolInterface):
         content = params.get("content")
         reply_to_event_id = params.get("reply_to_id")
         format_as_markdown = params.get("format_as_markdown", True)
-        image_url = params.get("image_url")
+        image_url = None if params.get("delivery_id") else params.get("image_url")
 
         missing_params = []
         if not room_id:
@@ -69,7 +69,7 @@ class SendMatrixReplyTool(ToolInterface):
             return {"status": "failure", "error": error_msg, "timestamp": time.time()}
 
         # Auto-attachment: Check for recently generated media if no image_url provided
-        if not image_url and context.world_state_manager:
+        if not params.get("delivery_id") and not image_url and context.world_state_manager:
             recent_media_url = context.world_state_manager.get_last_generated_media_url()
             if recent_media_url:
                 # Check if the media was generated recently (within last 5 minutes)
@@ -198,11 +198,13 @@ class SendMatrixReplyTool(ToolInterface):
             if format_as_markdown:
                 formatted = format_for_matrix(content)
                 result = await context.matrix_observer.send_formatted_reply(
-                    room_id, formatted["plain"], formatted["html"], reply_to_event_id
+                    room_id, formatted["plain"], formatted["html"], reply_to_event_id,
+                    **({"tx_id": params["delivery_id"]} if params.get("delivery_id") else {}),
                 )
             else:
                 result = await context.matrix_observer.send_reply(
-                    room_id, content, reply_to_event_id
+                    room_id, content, reply_to_event_id,
+                    **({"tx_id": params["delivery_id"]} if params.get("delivery_id") else {}),
                 )
             logger.info(f"Matrix observer send_reply returned: {result}")
 
@@ -268,7 +270,7 @@ class SendMatrixReplyTool(ToolInterface):
                 error_msg = f"Failed to send Matrix reply via observer: {result.get('error', 'unknown error')}"
                 logger.error(error_msg)
                 return {
-                    "status": "failure",
+                    "status": result.get("status", "failure"),
                     "error": error_msg,
                     "timestamp": time.time(),
                 }

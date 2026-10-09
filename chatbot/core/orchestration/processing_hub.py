@@ -145,15 +145,21 @@ class ProcessingHub:
                 # Get current world state
                 current_state = self.world_state.to_dict()
                 current_hash = self._hash_state(current_state)
+                pending_channels = []
+                if self.node_processor and hasattr(self.node_processor, "pending_channels"):
+                    pending = self.node_processor.pending_channels()
+                    if isinstance(pending, list):
+                        pending_channels = pending
 
                 # Check if state has changed
-                if current_hash != last_state_hash:
+                if current_hash != last_state_hash or pending_channels:
                     # Idle polling keeps the processing budget available for chat.
                     self.rate_limiter.record_cycle(cycle_start)
                     logger.info(f"World state changed, processing cycle {self.cycle_count}")
 
                     # Get active channels to determine primary focus
                     active_channels = self._get_active_channels(current_state)
+                    active_channels = list(dict.fromkeys(active_channels + pending_channels))
 
                     # Process using selected strategy
                     await self._process_world_state(active_channels)
@@ -230,6 +236,22 @@ class ProcessingHub:
             return
             
         try:
+            if self.node_processor and hasattr(self.node_processor, "pending_channels"):
+                saved_channels = self.node_processor.pending_channels()
+                if isinstance(saved_channels, list):
+                    scoped_channels = list(dict.fromkeys(saved_channels + [
+                        channel_id for channel_id in active_channels
+                        if (self.world_state.get_channel(channel_id)
+                            and self.world_state.get_channel(channel_id).type in {"discord", "matrix"})
+                    ]))
+                    for channel_id in scoped_channels:
+                        await self.node_processor.process_cycle(
+                            cycle_id=f"cycle_{self.cycle_count}", primary_channel_id=channel_id,
+                            context={"processing_mode": "traditional"},
+                        )
+                    active_channels = [channel_id for channel_id in active_channels if channel_id not in scoped_channels]
+                    if not active_channels:
+                        return
             # Determine primary channel
             primary_channel_id = self._get_primary_channel(active_channels)
             

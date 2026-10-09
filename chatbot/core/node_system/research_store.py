@@ -322,15 +322,16 @@ class ResearchStore:
                 None if status == "ready" else now, now, None if status == "sent" else "Delivery checked", turn_id))
             return True
 
-    def pending_channels(self) -> list[dict]:
+    def pending_channels(self, *, include_processing: bool = True) -> list[dict]:
         now = self.clock()
         with self._transaction() as db:
             self._recover_expired(db, now)
             rows = db.execute("""SELECT t.platform,t.channel_id FROM research_turns t
                 WHERE t.status IN ('queued','ready') AND t.retry_at<=?
+                AND (t.status='ready' OR t.kind='command' OR ?)
                 AND t.id=(SELECT MIN(first.id) FROM research_turns first
                     WHERE first.platform=t.platform AND first.channel_id=t.channel_id
-                    AND first.status IN ('queued','running','effect_started','ready','sending')) ORDER BY t.id""", (now,)).fetchall()
+                    AND first.status IN ('queued','running','effect_started','ready','sending')) ORDER BY t.id""", (now, include_processing)).fetchall()
             return [dict(row) for row in rows]
 
     def cached_source(self, platform: str, channel_id: str, tool: str, params: dict) -> dict | None:

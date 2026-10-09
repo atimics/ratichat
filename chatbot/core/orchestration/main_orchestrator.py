@@ -361,6 +361,12 @@ class MainOrchestrator:
         
         # Core components
         self.world_state = WorldStateManager()
+        from ..node_system.research_store import ResearchStore
+        from ..node_system.processor import capture_request
+        self.research_store = ResearchStore(self.config.db_path, retention_days=settings.RESEARCH_RETENTION_DAYS)
+        self.world_state.on_message_added = lambda channel_id, message: capture_request(
+            self.world_state, self.capability_policy, self.research_store, channel_id, message,
+        )
         self.payload_builder = PayloadBuilder()
         self.rate_limiter = RateLimiter(self.config.rate_limit_config)
         self.context_manager = ContextManager(self.world_state, self.config.db_path)
@@ -726,6 +732,7 @@ class MainOrchestrator:
         from ..node_system.processor import NodeProcessor
         node_processor = NodeProcessor(
             self.world_state, self.payload_builder, traditional_processor, self.config.db_path,
+            research_store=self.research_store,
         )
         self.processing_hub.set_node_processor(node_processor)
 

@@ -26,4 +26,5 @@ class SendDiscordReplyTool(ToolInterface):
             return {"status": "failure", "error": "Connect Discord first"}
         return await observer.send_reply(
             params.get("channel_id"), params.get("content"), params.get("reply_to_id"),
+            **({"delivery_id": params["delivery_id"]} if params.get("delivery_id") else {}),
         )

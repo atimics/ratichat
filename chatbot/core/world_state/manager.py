@@ -45,6 +45,7 @@ class WorldStateManager:
 
     def __init__(self):
         self.state = WorldStateData()
+        self.on_message_added = None
         
         # Initialize system status
         self.state.system_status = {
@@ -139,6 +140,9 @@ class WorldStateManager:
         if len(self.state.channels[channel_id].recent_messages) > 50:
             self.state.channels[channel_id].recent_messages = self.state.channels[channel_id].recent_messages[-50:]
         self.state.channels[channel_id].update_last_checked()
+
+        if self.on_message_added:
+            self.on_message_added(channel_id, message)
 
     def add_message_compat(self, channel_id_or_dict, message=None):
         """Compatibility wrapper for tests that call add_message with (dict, message) or (message_data, message)."""
