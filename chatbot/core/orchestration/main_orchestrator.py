@@ -6,6 +6,7 @@ Acts as the primary entry point and coordinates between different subsystems.
 """
 
 import asyncio
+from copy import copy
 import json
 import logging
 import time
@@ -32,7 +33,7 @@ from ..world_state.payload_builder import PayloadBuilder
 from .processing_hub import ProcessingHub, ProcessingConfig
 from .rate_limiter import RateLimiter, RateLimitConfig
 from ..proactive import ProactiveConversationEngine
-from .capability_policy import CapabilityPolicy, ExecutionScope
+from .capability_policy import CapabilityPolicy, ExecutionScope, SOURCE_WATCH_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +178,7 @@ class TraditionalProcessor:
                 return
                 
             # Execute the tool with parameters and context
-            result = await tool.execute(action.parameters, self.action_context)
+            result = await tool.execute(action.parameters, self._tool_context(action.action_type, execution_scope))
             
             # Log the action result
             await self.context_manager.add_tool_result(
@@ -203,6 +204,13 @@ class TraditionalProcessor:
                     "parameters": action.parameters
                 }
             )
+
+    def _tool_context(self, tool_name, execution_scope):
+        if tool_name not in SOURCE_WATCH_TOOLS:
+            return self.action_context
+        context = copy(self.action_context)
+        context.execution_scope = execution_scope
+        return context
 
     async def _record_blocked_action(
         self, action: ActionPlan, message: str
@@ -265,6 +273,7 @@ class TraditionalProcessor:
         execution_scope: ExecutionScope | None = None,
     ) -> dict:
         """Execute a single action and return the result for coordination."""
+        result = None
         try:
             denial_reason = self.capability_policy.denial_reason(
                 action.action_type, action.parameters, execution_scope
@@ -279,7 +288,7 @@ class TraditionalProcessor:
                 return {"status": "error", "error": f"Tool unavailable: {action.action_type}"}
                 
             # Execute the tool with parameters and context
-            result = await tool.execute(action.parameters, self.action_context)
+            result = await tool.execute(action.parameters, self._tool_context(action.action_type, execution_scope))
             
             # Log the action result
             await self.context_manager.add_tool_result(
@@ -297,6 +306,9 @@ class TraditionalProcessor:
             
         except Exception as e:
             logger.error(f"Error executing action {action.action_type}: {e}")
+            if action.action_type in SOURCE_WATCH_TOOLS and isinstance(result, dict):
+                # The store saved the change and receipt in one transaction.
+                return result
             # Log the failed action
             await self.context_manager.add_tool_result(
                 channel_id="system",
@@ -357,6 +369,7 @@ class MainOrchestrator:
             operator_user_ids=settings.MATRIX_OPERATOR_USER_IDS.split(","),
             managed_room_ids=settings.MATRIX_MANAGED_ROOM_IDS.split(","),
             approved_discord_channel_ids=settings.DISCORD_ALLOWED_CHANNEL_IDS.split(","),
+            discord_owner_user_ids=settings.DISCORD_OWNER_USER_IDS.split(","),
         )
         
         # Core components
@@ -542,6 +555,9 @@ class MainOrchestrator:
         self.tool_registry.register_tool(WebSearchTool())
         self.tool_registry.register_tool(ReadWebpageTool())
         self.tool_registry.register_tool(ReadFeedTool())
+        from ...tools.source_watch_tools import CreateSourceWatchTool, ListSourceWatchesTool, RemoveSourceWatchTool, GetSourceDigestTool
+        for tool in (CreateSourceWatchTool(), ListSourceWatchesTool(), RemoveSourceWatchTool(), GetSourceDigestTool()):
+            self.tool_registry.register_tool(tool)
         self.tool_registry.register_tool(UpdateResearchTool())
         self.tool_registry.register_tool(QueryResearchTool())
         
@@ -752,6 +768,7 @@ class MainOrchestrator:
         self.source_watch_service = SourceWatchService(watch_store, send=delivery.send,
             reconcile=delivery.reconcile, action_context=self.action_context,
             daily_lookup_budget=settings.SOURCE_WATCH_DAILY_LOOKUP_BUDGET)
+        self.action_context.source_watch_service = self.source_watch_service
         node_processor.watch_service = self.source_watch_service
         self.processing_hub.set_node_processor(node_processor)
 

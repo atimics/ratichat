@@ -44,17 +44,17 @@ separate source adapter when that account is connected.
 
 ## Feed watches
 
-The owner can add RSS, Atom, or GitHub release watches in a configured channel:
+Ask RatiChat in plain English to track a public feed, show current watches,
+stop a watch, or summarise its latest entries. For example: “Keep an eye on
+CPython releases and tell me about new versions each hour.”
 
-- `@ratichat watch https://github.com/python/cpython/releases.atom every 1h`
-- `@ratichat watches`
-- `@ratichat digest`
-- `@ratichat digest WATCH_ID`
-- `@ratichat unwatch WATCH_ID`
-
-These commands use the saved request queue and run directly from the human
-message. The first check saves a quiet baseline. Later checks post new entries
-with titles, short summaries, and links. `digest` shows the latest saved entries.
+The agent can call `create_source_watch`, `list_source_watches`,
+`remove_source_watch`, and `get_source_digest`. The current saved request supplies
+the sender and channel. Creating and removing watches requires the configured
+owner. The agent reads the actual tool result before it confirms a change.
+Each change and its tool receipt are saved together, so retries keep the same
+result. The first feed check saves a quiet baseline. Later checks post new entries
+with titles, short summaries, and links. Digest reads show the latest saved entries.
 Each update has a receipt and a fixed destination. Saved updates survive restarts.
 
 Set `DISCORD_OWNER_USER_IDS` to the owner's Discord user ID. Matrix watches use
