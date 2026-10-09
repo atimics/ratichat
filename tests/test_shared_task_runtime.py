@@ -346,3 +346,29 @@ async def test_jev_continuation_choices_include_saved_work_and_skip_placeholder(
         service.router = ModelRouter("key", client=client, catalog=catalog())
         continued = await service.prepare(processor.world_state.get_channel("!public:test"), source)
     assert continued.task["id"] == first.task["id"]
+
+
+def test_collapsed_nodes_keep_current_project_evidence(tmp_path):
+    processor, service, store, ai, sends = setup(tmp_path)
+    message(processor, store, "discord", "general", "owner", "d1", "Our shared project uses Python 3.14")
+    node = store.catalog("matrix", "!public:test", "@owner:test")["channels.discord.general"]
+    assert "Python 3.14" in node["summary"]
+    assert node["summary_version"] == node["version"]
+    store.edit_message("discord", "general", "d1", {"content": "Our shared project uses Python 3.15"})
+    node = store.catalog("matrix", "!public:test", "@owner:test")["channels.discord.general"]
+    assert "Python 3.15" in node["summary"]
+    assert "Python 3.14" not in node["summary"]
+
+
+@pytest.mark.asyncio
+async def test_fast_worker_and_composers_accept_fenced_json(monkeypatch):
+    response = httpx.Response(200, request=httpx.Request("POST", CHAT_URL), json={"choices": [{"message": {
+        "content": '```json\n{"content":"Python 3.14","publish":true,"item_id":"one"}\n```'}}]})
+    client = AsyncMock()
+    client.post.return_value = response
+    client.__aenter__.return_value = client
+    monkeypatch.setattr("chatbot.core.ai_engine.httpx.AsyncClient", lambda **kwargs: client)
+    engine = AIDecisionEngine("key")
+    assert await engine.compose_reply({}) == "Python 3.14"
+    assert await engine.compose_task_worker({"goal": "Check version"}) == "Python 3.14"
+    assert (await engine.compose_proactive({}))["publish"] is True

@@ -79,7 +79,8 @@ def test_edit_invalidates_derived_nodes_and_stale_summaries(store):
     assert edited["revision"] == 2
     catalog = store.catalog("matrix", "room", "bob")
     assert "topics.python" not in catalog and "facts.project" not in catalog
-    assert catalog[source["node_id"]]["summary"] == ""
+    assert "Rust project" in catalog[source["node_id"]]["summary"]
+    assert "Python project" not in catalog[source["node_id"]]["summary"]
     assert store.publish_summary(source["node_id"], channel["version"], "Old summary")["conflict"]
     assert store.request_current("discord", "general", "e1", "Rust project")
     assert not store.request_current("discord", "general", "e1", "Python project")
