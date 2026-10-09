@@ -82,8 +82,7 @@ class SearchSocialTool(ToolInterface):
             if not isinstance(query, str) or not query.strip() or len(query) > 350:
                 raise ValueError("Provide a public topic of 1 to 350 characters")
             domains = SOCIAL_DOMAINS[platform]
-            focused = "(" + " OR ".join("site:" + domain for domain in domains) + ") " + query.strip()
-            result = await WebSearchTool().execute({"query": focused}, context)
+            result = await WebSearchTool().search(query.strip(), context, domains=domains)
             if result.get("status") != "success":
                 return {**result, "platform": platform, "access": "public_search_index"}
             sources = []

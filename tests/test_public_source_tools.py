@@ -1,7 +1,6 @@
 """Public sources, domain limits, bounded content, and tool availability."""
 
 import json
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -43,11 +42,12 @@ async def test_social_search_keeps_only_public_posts_from_the_requested_platform
         {"url": "https://reddit.com.attacker.example/thread", "title": "Other"},
         {"url": "http://127.0.0.1/secret"},
     ]})
-    monkeypatch.setattr(source.WebSearchTool, "execute", search)
+    monkeypatch.setattr(source.WebSearchTool, "search", search)
     result = await source.SearchSocialTool().execute({"platform": "reddit", "query": "Python releases"}, None)
     assert result["status"] == "success" and result["access"] == "public_search_index"
     assert len(result["sources"]) == 1 and len(result["sources"][0]["content"]) == 1500
-    assert search.await_args.args[0]["query"].startswith("(site:reddit.com)")
+    assert search.await_args.args[0] == "Python releases"
+    assert search.await_args.kwargs["domains"] == ("reddit.com",)
     for params in ({"platform": "private", "query": "one"}, {"platform": "reddit", "query": "x" * 351},
                    {"platform": "reddit", "query": "one", "sender_id": "owner"}):
         assert (await source.SearchSocialTool().execute(params, None))["status"] == "failure"
@@ -56,7 +56,7 @@ async def test_social_search_keeps_only_public_posts_from_the_requested_platform
 
 @pytest.mark.asyncio
 async def test_social_search_failure_is_available_to_the_agent(monkeypatch):
-    monkeypatch.setattr(source.WebSearchTool, "execute", AsyncMock(return_value={"status": "failure", "error": "Search service returned HTTP 429"}))
+    monkeypatch.setattr(source.WebSearchTool, "search", AsyncMock(return_value={"status": "failure", "error": "Search service returned HTTP 429"}))
     result = await source.SearchSocialTool().execute({"platform": "x", "query": "AI tools"}, None)
     assert result["status"] == "failure" and "429" in result["error"]
 
