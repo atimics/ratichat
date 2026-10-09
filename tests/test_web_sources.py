@@ -114,6 +114,18 @@ async def test_feed_supports_rss_and_atom_links(xml):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("xml", [
+    '<rss><channel><item><guid>release-1</guid><title>Release</title></item></channel></rss>',
+    '<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>release-1</id><title>Release</title></entry></feed>',
+])
+async def test_feed_preserves_entry_identity_after_a_redirect(xml):
+    with patch("chatbot.tools.web_tools.fetch_public_text", AsyncMock(return_value=("https://example.com/canonical", xml, "application/xml"))):
+        result = await ReadFeedTool().execute({"url": "https://example.com/feed"}, None)
+    assert result["items"][0]["id"] == "release-1"
+    assert result["items"][0]["url"] == "https://example.com/canonical"
+
+
+@pytest.mark.asyncio
 async def test_feed_rejects_xml_entities():
     with patch("chatbot.tools.web_tools.fetch_public_text", AsyncMock(return_value=("https://example.com/feed", '<!DOCTYPE x [<!ENTITY a "x">]><rss/>', "application/xml"))):
         result = await ReadFeedTool().execute({"url": "https://example.com/feed"}, None)

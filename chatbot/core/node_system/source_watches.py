@@ -16,6 +16,13 @@ from ...tools.web_tools import ReadFeedTool, page_text, public_url
 HELP = "Use `watch <public RSS/Atom URL> [every 1h|60m]`, `watches`, `unwatch <id>`, or `digest [id]`. Intervals range from 15 minutes to 24 hours."
 
 
+def watch_command(text):
+    """Read a command from the human's message before an AI step."""
+    text = re.sub(r"^\s*<@!?\d+>\s*", "", str(text or "")).strip()
+    verb = text.split(maxsplit=1)[0].lower() if text else ""
+    return text if verb in {"watch", "watches", "unwatch", "digest"} else None
+
+
 def _scope(value):
     def field(name):
         result = value.get(name) if isinstance(value, dict) else getattr(value, name, None)
@@ -252,7 +259,7 @@ class WatchStore:
                 return None
             keys = sorted(item["key"] for item in new_items)
             delivery_key = hashlib.sha256((watch["id"] + ":" + ":".join(keys)).encode()).hexdigest()
-            text = _digest(watch, new_items)
+            text = _digest(watch, new_items) + "\n\nReceipt: " + delivery_key[:12]
             db.execute("INSERT INTO source_watch_deliveries(delivery_key,watch_id,status,text,item_keys,prepared_at) VALUES (?,?,?,?,?,?)",
                        (delivery_key, watch["id"], "pending", text, json.dumps(keys), now))
             db.execute("UPDATE source_watches SET pending_text=?,pending_keys=?,delivery_key=?,pending_status='pending',next_due=? WHERE id=?",

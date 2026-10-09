@@ -224,6 +224,7 @@ class ReadFeedTool(ToolInterface):
                 href = (link.get("href") or value("link")) if link is not None else ""
                 item_url = str(public_url(urljoin(url, href))) if href else url
                 items.append({"title": page_text(value("title"))[:200], "url": item_url,
+                              "id": (value("id") or value("guid"))[:500],
                               "published": value("pubDate") or value("published") or value("updated"),
                               "summary": page_text(value("description") or value("summary") or value("content"))[:500]})
                 if len(items) == 10:

@@ -180,7 +180,7 @@ class ResearchStore:
         return db.execute("""SELECT * FROM research_turns WHERE platform=? AND channel_id=?
             AND status IN ('queued','running','effect_started','ready','sending') ORDER BY id LIMIT 1""", (platform, channel_id)).fetchone()
 
-    def claim(self, platform: str, channel_id: str, *, lease_seconds: float = 120) -> dict | None:
+    def claim(self, platform: str, channel_id: str, *, lease_seconds: float = 120, include_processing: bool = True) -> dict | None:
         """Claim the oldest request with a new token and a limited lease."""
         platform, channel_id = self._scope(platform, channel_id)
         now = self.clock()
@@ -188,6 +188,8 @@ class ResearchStore:
             self._recover_expired(db, now)
             row = self._first_active(db, platform, channel_id)
             if row is None or row["status"] != "queued" or row["retry_at"] > now:
+                return None
+            if not include_processing and row["kind"] != "command":
                 return None
             token = uuid.uuid4().hex
             db.execute("""UPDATE research_turns SET status='running',attempts=attempts+1,

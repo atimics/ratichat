@@ -14,6 +14,7 @@ from ..orchestration.capability_policy import READ_ONLY_SOURCE_TOOLS
 from .interaction_tools import NodeInteractionTools
 from .node_manager import NodeManager
 from .research_store import ResearchStore
+from .source_watches import watch_command
 from ..world_state.structures import Channel, Message
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,8 @@ def capture_request(world_state, policy, store, channel_id, message, *, accepted
     snapshot = {"channel": {"id": channel.id, "type": channel.type, "name": channel.name,
                            "recent_messages": [asdict(item) for item in messages[max(0, index - 6):index + 1]]},
                 "source": asdict(message)}
-    return store.enqueue(channel.type, channel.id, message.id, snapshot)
+    return store.enqueue(channel.type, channel.id, message.id, snapshot,
+                         kind="command" if watch_command(message.content) else "request")
 
 
 class NodeProcessor:
@@ -129,9 +131,8 @@ class NodeProcessor:
         if delivery:
             result = await self._deliver(delivery)
             return self._result(1, 0, 0, failed=result.get("status") != "success")
-        if not self.ai_engine.api_key:
-            return {"actions_executed": 0}
-        turn = self.research_store.claim(platform, primary_channel_id, lease_seconds=900)
+        turn = self.research_store.claim(platform, primary_channel_id, lease_seconds=900,
+                                         include_processing=bool(self.ai_engine.api_key))
         if not turn:
             return {"actions_executed": 0, "duplicate": True}
         saved = self._saved_channel(turn)
@@ -140,6 +141,20 @@ class NodeProcessor:
             self.research_store.fail(turn["id"], turn["lease_token"], "Use a configured channel", retryable=False)
             return self._result(0, 0, 0, failed=True)
         self._restore_discord(turn)
+        command = watch_command(turn["snapshot"]["source"]["content"])
+        if command and self.watch_service:
+            source = turn["snapshot"]["source"]
+            command_scope = {"channel_type": platform, "channel_id": saved.id,
+                             "sender_id": source["sender"], "event_id": source["id"]}
+            owners = self.watch_service.store.owner_ids.get(platform, ())
+            text = await self.watch_service.manage(command, command_scope, is_owner=source["sender"] in owners)
+            payload = self.payload_builder.build_request_node_payload(saved, self.node_manager)
+            scope = self.policy.scope_from_payload(payload)
+            reply = ActionPlan({"discord": "send_discord_reply", "matrix": "send_matrix_reply"}[platform],
+                               {"channel_id": saved.id, "reply_to_id": source["id"], "content": text,
+                                "format_as_markdown": False}, "Report the source-watch command result", 1)
+            result = await self._save_and_send(reply, scope, turn, {})
+            return self._result(1, 0, 0, failed=result.get("status") != "success")
         return await self._run_cycle(cycle_id, primary_channel_id, context, saved, turn)
 
     async def _save_and_send(self, action, scope, turn, sources):
@@ -247,6 +262,17 @@ class NodeProcessor:
             sources["channel.memory"] = self.research_store.memory_node(channel.type, channel.id)
             self.node_manager.expand_node("channel.memory")
             self.node_manager.pin_node("channel.memory")
+        if self.watch_service and channel.type in {"discord", "matrix"}:
+            watch_node = {"trust_label": "untrusted", "watches": []}
+            for watch in self.watch_service.store.list({"channel_type": channel.type, "channel_id": channel.id}):
+                record = {"id": watch["id"], "url": watch["url"], "fetched_at": watch["fetched_at"],
+                          "interval_seconds": watch["interval_seconds"],
+                          "latest_entries": json.loads(watch["last_items"])[:3]}
+                watch_node["watches"].append(record)
+                if len(json.dumps(watch_node)) > 6000:
+                    watch_node["watches"].pop()
+                    break
+            sources["sources.watches"] = watch_node
         scope_payload = self.payload_builder.build_request_node_payload(channel, self.node_manager)
         channel_node = scope_payload["expanded_nodes"][channel_path]["data"]
         scope = self.policy.scope_from_payload(scope_payload)

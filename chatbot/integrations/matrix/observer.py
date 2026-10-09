@@ -842,7 +842,7 @@ class MatrixObserver(Integration):
 
         return user_details
 
-    async def send_message(self, room_id: str, content: str) -> Dict[str, Any]:
+    async def send_message(self, room_id: str, content: str, tx_id: str = None) -> Dict[str, Any]:
         """Send a message to a Matrix room"""
         if not self.client:
             return {"success": False, "error": "Matrix client not connected"}
@@ -852,12 +852,17 @@ class MatrixObserver(Integration):
                 room_id=room_id,
                 message_type="m.room.message",
                 content={"msgtype": "m.text", "body": content},
+                **({"tx_id": tx_id} if tx_id else {}),
             )
 
             if isinstance(response, RoomSendResponse):
                 logger.info(
                     f"MatrixObserver: Sent message to {room_id} (event: {response.event_id})"
                 )
+                if tx_id:
+                    self.reply_receipts[tx_id] = {"event_id": response.event_id, "room_id": room_id}
+                    if len(self.reply_receipts) > 1000:
+                        self.reply_receipts.pop(next(iter(self.reply_receipts)))
                 return {
                     "success": True,
                     "event_id": response.event_id,
@@ -869,7 +874,7 @@ class MatrixObserver(Integration):
 
         except Exception as e:
             logger.error(f"MatrixObserver: Error sending message: {e}")
-            return {"success": False, "error": str(e)}
+            return {"success": False, "status": "unknown" if tx_id else "failure", "error": str(e)}
 
     async def send_reply(
         self, room_id: str, content: str, reply_to_event_id: str, tx_id: str = None

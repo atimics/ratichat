@@ -34,6 +34,7 @@ class DiscordObserver(Integration):
         self._send_lock = asyncio.Lock()
         self._requests = OrderedDict()
         self._replies = OrderedDict()
+        self._digest_receipts = OrderedDict()
 
     @property
     def integration_type(self):
@@ -189,6 +190,53 @@ class DiscordObserver(Integration):
                     return {"status": "success", "message_id": str(message.id)}
         except Exception:
             logger.warning("Discord reply receipt needs another check")
+        return {"status": "unknown"}
+
+    async def send_digest(self, channel_id, content, delivery_id):
+        """Send an owner-created watch update to its fixed channel."""
+        channel_id = str(channel_id)
+        if not self.client or not self.client.is_ready():
+            return {"status": "failure", "error": "Connect Discord first"}
+        if channel_id not in self.allowed_channel_ids:
+            return {"status": "failure", "error": "Choose a configured watch channel"}
+        if not isinstance(content, str) or not content.strip() or len(content) > 2000:
+            return {"status": "failure", "error": "Use watch text up to 2000 characters"}
+        async with self._send_lock:
+            if delivery_id in self._digest_receipts:
+                return {"status": "success", "message_id": self._digest_receipts[delivery_id]}
+            channel = self.client.get_channel(int(channel_id))
+            if channel is None or str(channel.guild.id) not in self.allowed_guild_ids:
+                return {"status": "failure", "error": "Choose a configured server channel"}
+            try:
+                sent = await channel.send(content, allowed_mentions=discord.AllowedMentions.none(),
+                    nonce=hashlib.sha256(delivery_id.encode()).hexdigest()[:24])
+                self._digest_receipts[delivery_id] = str(sent.id)
+                while len(self._digest_receipts) > 1000:
+                    self._digest_receipts.popitem(last=False)
+                return {"status": "success", "message_id": str(sent.id)}
+            except (discord.Forbidden, discord.NotFound):
+                return {"status": "failure", "error": "Check watch channel access"}
+            except discord.HTTPException as error:
+                return {"status": "failure" if error.status < 500 else "unknown"}
+            except Exception:
+                return {"status": "unknown"}
+
+    async def reconcile_digest(self, channel_id, content, delivery_id):
+        channel_id = str(channel_id)
+        if delivery_id in self._digest_receipts:
+            return {"status": "success", "message_id": self._digest_receipts[delivery_id]}
+        if not self.client or not self.client.is_ready() or channel_id not in self.allowed_channel_ids:
+            return {"status": "unknown"}
+        channel = self.client.get_channel(int(channel_id))
+        if channel is None or str(channel.guild.id) not in self.allowed_guild_ids:
+            return {"status": "unknown"}
+        try:
+            async for message in channel.history(limit=100):
+                if message.author.id == self.client.user.id and message.content == content:
+                    self._digest_receipts[delivery_id] = str(message.id)
+                    return {"status": "success", "message_id": str(message.id)}
+        except Exception:
+            logger.warning("Discord watch receipt needs another check")
         return {"status": "unknown"}
 
     async def send_reply(self, channel_id, content, reply_to_id, delivery_id=None):

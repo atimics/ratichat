@@ -119,6 +119,39 @@ async def test_source_edit_requires_fresh_mention(observer):
     channel.send.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_watch_digest_has_fixed_channel_and_saved_nonce(observer):
+    channel = SimpleNamespace(guild=SimpleNamespace(id=10), send=AsyncMock(return_value=SimpleNamespace(id=91)))
+    observer.client.get_channel = Mock(return_value=channel)
+    text = "New entries · watch abc\nReceipt: unique"
+    first = await observer.send_digest("20", text, "saved-key")
+    assert first["message_id"] == "91"
+    assert (await observer.send_digest("20", text, "saved-key"))["message_id"] == "91"
+    channel.send.assert_awaited_once()
+    assert channel.send.await_args.kwargs["allowed_mentions"].to_dict() == {"parse": []}
+    assert len(channel.send.await_args.kwargs["nonce"]) == 24
+    assert (await observer.send_digest("99", text, "other-key"))["status"] == "failure"
+    channel.guild.id = 99
+    assert (await observer.send_digest("20", text, "other-key"))["status"] == "failure"
+
+
+@pytest.mark.asyncio
+async def test_watch_digest_recovers_accepted_send_after_lost_response(observer):
+    text = "New entries · watch abc\nReceipt: unique"
+    accepted = SimpleNamespace(id=91, content=text, author=SimpleNamespace(id=30))
+    async def history(**kwargs):
+        yield SimpleNamespace(id=90, content=text, author=SimpleNamespace(id=50))
+        yield accepted
+    channel = SimpleNamespace(guild=SimpleNamespace(id=10), history=history,
+                              send=AsyncMock(side_effect=TimeoutError("lost response")))
+    observer.client.get_channel = Mock(return_value=channel)
+    assert (await observer.send_digest("20", text, "saved-key"))["status"] == "unknown"
+    receipt = await observer.reconcile_digest("20", text, "saved-key")
+    assert receipt["message_id"] == "91"
+    assert (await observer.send_digest("20", text, "saved-key"))["message_id"] == "91"
+    channel.send.assert_awaited_once()
+
+
 @pytest.mark.parametrize("profile", ["public", "matrix_steward", "operator"])
 def test_discord_policy_checks_destination_latest_source_and_platform(profile):
     policy = CapabilityPolicy(profile, approved_discord_channel_ids=["20"])
