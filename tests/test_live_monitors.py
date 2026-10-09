@@ -13,6 +13,7 @@ from chatbot.core.node_system.source_watches import WatchStore
 from chatbot.core.orchestration.capability_policy import CapabilityPolicy, ExecutionScope
 from chatbot.tools.live_monitor_tools import CreateLiveMonitorTool
 from chatbot.tools.onchain_tools import ExplorerHTTPError, OnchainReader, normalize_targets
+from chatbot.config import settings
 
 
 BTC = "bc1q" + "a" * 38
@@ -144,6 +145,71 @@ async def test_rate_limit_pauses_host_and_keeps_other_networks_available():
     assert len([u for u in calls if "eth.blockscout" in u]) == 1
     assert all(s["status"] == "ok" for s in result["streams"] if s["network"] == "base")
     assert reader._host_backoff["eth.blockscout.com"]["until"] - time.monotonic() > 119
+
+
+@pytest.mark.asyncio
+async def test_key_is_used_only_when_public_history_needs_access(monkeypatch):
+    monkeypatch.setattr(settings, "BLOCKSCOUT_API_KEY", "private-test-key")
+    calls = []
+    async def fetch(url, headers):
+        calls.append((url, headers))
+        return {"items": [], "next_page_params": None}
+    result = await OnchainReader(fetch).check([{"address": EVM, "network": "ethereum"}])
+    assert all(s["status"] == "ok" for s in result["streams"])
+    assert len(calls) == 2 and all("eth.blockscout.com" in url and not headers for url, headers in calls)
+
+
+@pytest.mark.asyncio
+async def test_paid_chain_access_error_keeps_free_chain_and_public_reads_working(monkeypatch):
+    monkeypatch.setattr(settings, "BLOCKSCOUT_API_KEY", "private-test-key")
+    calls = []
+    async def fetch(url, headers):
+        calls.append((url, headers))
+        if "base.blockscout" in url or "arbitrum.blockscout" in url or "api.blockscout.com/8453/" in url:
+            raise ExplorerHTTPError(403)
+        return {"items": [], "next_page_params": None}
+    reader = OnchainReader(fetch)
+    result = await reader.check([{"address": EVM, "network": network} for network in ("ethereum", "base", "arbitrum")])
+    assert all(s["status"] == ("error" if s["network"] == "base" else "ok") for s in result["streams"])
+    assert "api.blockscout.com/8453" in reader._host_backoff and "api.blockscout.com" not in reader._host_backoff
+    assert sum("api.blockscout.com/8453/" in url for url, _ in calls) == 1
+    assert sum("api.blockscout.com/42161/" in url for url, _ in calls) == 2
+    assert all(headers == {"Authorization": "Bearer private-test-key"} for url, headers in calls if "api.blockscout.com" in url)
+    assert all(not headers for url, headers in calls if "api.blockscout.com" not in url)
+    assert all("private-test-key" not in s.get("message", "") for s in result["streams"])
+
+
+@pytest.mark.asyncio
+async def test_key_quota_pauses_shared_api_and_preserves_public_reads(monkeypatch):
+    monkeypatch.setattr(settings, "BLOCKSCOUT_API_KEY", "private-test-key")
+    calls = []
+    async def fetch(url, headers):
+        calls.append(url)
+        if "api.blockscout.com" in url:
+            raise ExplorerHTTPError(429, 120)
+        if "base.blockscout" in url or "arbitrum.blockscout" in url:
+            raise ExplorerHTTPError(403)
+        return {"items": [], "next_page_params": None}
+    result = await OnchainReader(fetch).check([{"address": EVM}])
+    assert all(s["status"] == "ok" for s in result["streams"] if s["network"] in {"ethereum", "optimism", "polygon"})
+    assert sum("api.blockscout.com" in url for url in calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_key_fallback_keeps_the_pagination_cursor(monkeypatch):
+    monkeypatch.setattr(settings, "BLOCKSCOUT_API_KEY", "private-test-key")
+    calls = []
+    async def fetch(url, headers):
+        calls.append(url)
+        if "?" in url and "eth.blockscout.com" in url:
+            raise ExplorerHTTPError(403)
+        if "?" in url:
+            assert "block_number=9" in url
+            return {"items": [], "next_page_params": None}
+        return {"items": [], "next_page_params": {"block_number": 9}}
+    result = await OnchainReader(fetch).check([{"address": EVM, "network": "ethereum"}])
+    assert all(s["status"] == "ok" for s in result["streams"])
+    assert any("api.blockscout.com/1/" in url and "block_number=9" in url for url in calls)
 
 
 @pytest.mark.asyncio

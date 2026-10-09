@@ -75,8 +75,8 @@ def _event(network, txid, url, timestamp, **fields):
 
 
 class ExplorerHTTPError(ValueError):
-    def __init__(self, status, retry_after=0):
-        super().__init__(f"Explorer HTTP {status}. Check provider access and quota.")
+    def __init__(self, status, retry_after=0, message=None):
+        super().__init__(message or f"Explorer HTTP {status}. Check provider access and quota.")
         self.status = status
         try:
             self.retry_after = min(900, max(0, float(retry_after or 0)))
@@ -92,13 +92,18 @@ class OnchainReader:
         self._host_locks, self._host_next, self._host_backoff = {}, {}, {}
 
     async def _read(self, url, headers):
-        host = urlsplit(url).hostname
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        access_scope = host + "/" + parsed.path.split("/")[1] if host == "api.blockscout.com" else host
         lock = self._host_locks.setdefault(host, asyncio.Lock())
         async with lock:
             now = time.monotonic()
-            backoff = self._host_backoff.get(host, {})
-            if backoff.get("until", 0) > now:
-                raise ValueError(f"Explorer HTTP {backoff['status']}; retry after {int(backoff['until'] - now) + 1} seconds.")
+            for scope in {host, access_scope}:
+                backoff = self._host_backoff.get(scope, {})
+                if backoff.get("until", 0) > now:
+                    delay = int(backoff["until"] - now) + 1
+                    raise ExplorerHTTPError(backoff["status"], delay,
+                        f"Explorer HTTP {backoff['status']}; retry after {delay} seconds.")
             await asyncio.sleep(max(0, self._host_next.get(host, 0) - now))
             self._host_next[host] = time.monotonic() + max(0, self.min_request_gap)
             try:
@@ -106,13 +111,29 @@ class OnchainReader:
                 if isinstance(data, dict) and data.get("success") is False and data.get("statusCode") in {403, 429}:
                     raise ExplorerHTTPError(data["statusCode"])
             except ExplorerHTTPError as error:
-                if error.status in {403, 429}:
+                if error.status in {402, 403, 429}:
+                    scope = host if error.status == 429 else access_scope
+                    backoff = self._host_backoff.get(scope, {})
                     failures = min(5, backoff.get("failures", 0) + 1)
                     delay = min(900, max(error.retry_after, 60 * 2 ** (failures - 1)))
-                    self._host_backoff[host] = {"status": error.status, "failures": failures, "until": time.monotonic() + delay}
+                    self._host_backoff[scope] = {"status": error.status, "failures": failures, "until": time.monotonic() + delay}
                 raise
             self._host_backoff.pop(host, None)
+            self._host_backoff.pop(access_scope, None)
             return data
+
+    async def _history(self, network, address, kind, cursor):
+        url, headers = self._request(network, address, kind, cursor)
+        try:
+            return await self._read(url, headers)
+        except ExplorerHTTPError as public_error:
+            if network not in EVM_NETWORKS or not settings.BLOCKSCOUT_API_KEY:
+                raise
+            url, headers = self._request(network, address, kind, cursor, use_pro=True)
+            try:
+                return await self._read(url, headers)
+            except ExplorerHTTPError as key_error:
+                raise ValueError(f"Public explorer HTTP {public_error.status}; key API HTTP {key_error.status}. Check provider access and quota.") from None
 
     async def _fetch(self, url, headers=None):
         connector = aiohttp.TCPConnector(resolver=PublicResolver(), use_dns_cache=False)
@@ -162,8 +183,7 @@ class OnchainReader:
         try:
             async with self._semaphore:
                 for page in range(3):
-                    url, headers = self._request(network, address, kind, cursor)
-                    data = await self._read(url, headers)
+                    data = await self._history(network, address, kind, cursor)
                     rows, cursor = self._rows(network, kind, data)
                     if any(not isinstance(row, dict) for row in rows):
                         raise ValueError("The explorer returned invalid transaction records.")
@@ -183,7 +203,7 @@ class OnchainReader:
             return {**base, "status": "error", "message": str(error)[:200] if isinstance(error, ValueError) else "Explorer read needs another attempt.",
                     "keys": [], "events": [], "source_url": self._address_url(network, address)}
 
-    def _request(self, network, address, kind, cursor):
+    def _request(self, network, address, kind, cursor, *, use_pro=False):
         headers = {}
         if network == "bitcoin":
             suffix = "/txs" if cursor is None else "/txs/chain/" + cursor
@@ -198,7 +218,7 @@ class OnchainReader:
                 params["fingerprint"] = cursor
             return "https://api.trongrid.io/v1/accounts/" + address + path + "?" + urlencode(params), headers
         chain_id, explorer, _ = EVM_NETWORKS[network]
-        if settings.BLOCKSCOUT_API_KEY:
+        if use_pro and settings.BLOCKSCOUT_API_KEY:
             explorer = f"https://api.blockscout.com/{chain_id}"
             headers["Authorization"] = "Bearer " + settings.BLOCKSCOUT_API_KEY
         url = explorer + "/api/v2/addresses/" + address + "/" + kind

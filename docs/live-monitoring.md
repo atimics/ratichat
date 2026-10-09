@@ -17,7 +17,9 @@ Configuration:
 - `LIVE_MONITOR_DAILY_LOOKUP_BUDGET`: scheduled checks per channel per UTC day; default 7200. Feed watches keep their own budget.
 - `ONCHAIN_REQUEST_GAP_SECONDS`: minimum gap between requests to the same explorer host; default one second. HTTP 403 and 429 responses pause that host with backoff. The reader honors numeric `Retry-After` values up to fifteen minutes.
 - `TRONGRID_API_KEY`: optional provider key for production quota and access.
-- `BLOCKSCOUT_API_KEY`: optional PRO API key. With a key, the reader uses the official multichain API and a bearer header. Public per-instance access depends on the explorer's current policy.
+- `BLOCKSCOUT_API_KEY`: optional PRO API key. The reader tries each public explorer first and uses the official multichain API when a public read fails. Only the multichain host receives the bearer header. Chain access errors pause the affected chain; shared API rate limits pause that host. Coverage depends on the key's plan and quota.
+
+To save provider keys in Fly, run `python3 scripts/set_explorer_keys.py` on the local computer with an authenticated Fly CLI. Open its private loopback link in Safari and paste either or both keys. The form stages secrets on `ratichat-bot-prod`; the next deployment applies them. The link closes after a successful save or fifteen minutes. Key values travel through stdin to the Fly CLI. The form uses a random private path, checks the request host and origin, and serves each response with `no-store`.
 
 The owner and channel come from the observed request. Monitoring tools use the configured Discord or Matrix channel for updates. A channel supports up to five saved watches and monitors in total. A monitor accepts up to twelve targets and a check interval from one minute to one day.
 
