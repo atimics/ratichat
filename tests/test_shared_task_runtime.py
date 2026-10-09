@@ -263,3 +263,16 @@ async def test_budget_limit_returns_status_to_original_channel(tmp_path):
     assert reply["reply_to_id"] == "d1"
     assert "fresh start" in reply["content"]
     ai.make_decision.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_passive_current_channel_context_keeps_request_authority(tmp_path):
+    processor, service, store, ai, sends = setup(tmp_path)
+    store.ingest_message("discord", "general", {"id": "passive", "sender": "guest", "content": "Our project uses Python 3.14", "timestamp": time.time() - 1})
+    message(processor, store, "discord", "general", "owner", "d1", "What version does our project use?")
+    await processor.process_cycle("passive", "general")
+    payload = ai.compose_reply.call_args.args[0]
+    assert "Python 3.14" in json.dumps(payload["answer_nodes"]["channels.discord.general"])
+    assert payload["current_request"]["id"] == "d1"
+    assert payload["channels"]["general"]["recent_messages"][-1]["sender_id"] == "owner"
+    assert sends["send_discord_reply"].call_args.args[0]["reply_to_id"] == "d1"

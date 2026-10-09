@@ -339,7 +339,7 @@ class NodeProcessor:
         self.node_manager.expand_node(channel_path)
         self.node_manager.pin_node(channel_path)
         sources = {
-            **({k: v for k, v in self._binding.nodes.items() if k != channel_path} if self._binding else {}),
+            **(self._binding.nodes if self._binding else {}),
             "sources.web": {"description": "Search current public web information with web_search."},
             "sources.pages": {"description": "Read public pages, project docs, or raw GitHub files with read_webpage."},
             "sources.feeds": {"description": "Read news, blogs, or GitHub release RSS/Atom feeds with read_feed."},
@@ -352,7 +352,7 @@ class NodeProcessor:
             self.node_manager.pin_node("channel.memory")
         if self.watch_service and channel.type in {"discord", "matrix"}:
             sources["sources.watches"] = self._watch_node(channel)
-        scope_payload = self.payload_builder.build_request_node_payload(channel, self.node_manager)
+        scope_payload = self.payload_builder.build_request_node_payload(channel, self.node_manager, sources)
         channel_node = scope_payload["expanded_nodes"][channel_path]["data"]
         scope = self.policy.scope_from_payload(scope_payload)
         proactive = getattr(self.executor.action_context, "proactive_source_service", None)
@@ -423,8 +423,8 @@ class NodeProcessor:
                     payload["answer_nodes"] = {
                         channel_path: channel_node,
                         **{path: data for path, data in sources.items()
-                           if not self._binding or path not in self._binding.nodes
-                           or self.node_manager.get_node_metadata(path).is_expanded},
+                           if path != channel_path and (not self._binding or path not in self._binding.nodes
+                           or self.node_manager.get_node_metadata(path).is_expanded)},
                     }
                     self.last_payload = copy.deepcopy(payload)
                     content = await self.ai_engine.compose_reply(payload)
