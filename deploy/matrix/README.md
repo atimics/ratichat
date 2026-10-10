@@ -122,8 +122,25 @@ Create a Pocket ID OIDC client named `RatiChat Matrix` with this exact callback:
 https://matrix.rati.chat/_continuwuity/oidc/complete
 ```
 
-Give the client the `openid` scope. Copy its client ID and secret into
-Continuwuity's Fly secrets:
+Give the client the `openid` scope. Then assign its allowed users:
+
+1. Open **User Groups** in Pocket ID. Create a group with the name
+   `ratichat-members` and the friendly name **RatiChat members**.
+2. Add the operator's Pocket ID account to this group. Add each invited account
+   when its chat access is approved.
+3. Open **OIDC Clients**, edit **RatiChat Matrix**, and expand
+   **Allowed User Groups**.
+4. Select **RatiChat members** and save. Keep the client restricted to this
+   group.
+5. Confirm that the client list shows **Allowed Group Count: 1** and
+   **Restricted: Yes**.
+
+Pocket ID v2 creates each OIDC client with restricted access. Its
+[allowed-group rules](https://pocket-id.org/docs/configuration/allowed-groups)
+require this assignment before a group member can sign in to Matrix. The
+operator's admin account also needs membership in the selected group.
+
+Copy the client's ID and secret into Continuwuity's Fly secrets:
 
 ```sh
 fly secrets set \
@@ -134,6 +151,18 @@ fly secrets set \
 
 Fly secrets hold the active values. Keep an encrypted recovery copy of the
 Pocket ID encryption key and OIDC client secret outside the mounted volumes.
+
+### Repair the access error
+
+If Pocket ID displays **You are not allowed to access this service**, check
+**OIDC Clients → RatiChat Matrix → Allowed User Groups**. A restricted client
+with an allowed group count of zero produces this error. Assign the approved
+chat group, save, and confirm that the affected account belongs to that group.
+
+Start a fresh sign-in from `https://chat.rati.chat` after saving the rule.
+Confirm that the browser completes the return to Matrix and opens the chat
+client. Service health checks and passkey authentication each cover part of
+this flow; successful chat entry is the access check.
 
 ## Deploy Matrix and Element Web
 
@@ -225,7 +254,8 @@ The expected values are:
 
 Complete each check before sending an external invite:
 
-1. `https://id.rati.chat/healthz` returns HTTP 200.
+1. `https://id.rati.chat/healthz` returns a successful HTTP status
+   (the pinned Pocket ID 2.14.0 image returns HTTP 204).
 2. `https://matrix.rati.chat/_matrix/client/versions` returns HTTP 200.
 3. `https://chat.rati.chat/config.json` points only to `matrix.rati.chat`.
 4. Both `rati.chat` discovery files return the committed JSON with
@@ -233,7 +263,8 @@ Complete each check before sending an external invite:
 5. The client discovery response includes `Access-Control-Allow-Origin: *`.
 6. Matrix federation reaches `matrix.rati.chat` on port 443.
 7. An invited user enrolls two independent passkeys on separate authenticators.
-8. Either passkey completes Element's OAuth login.
+8. The user belongs to **RatiChat members**, and **RatiChat Matrix** allows
+   this group. Either passkey completes Element's OAuth login and opens chat.
 9. A new browser restores the user's Matrix encryption keys and encrypted
    history through the selected Element recovery method.
 10. RatiChat joins, reads, and replies in an approved room with its service
