@@ -54,6 +54,12 @@ def setup(tmp_path, *, store=None, ai=None):
     world = WorldStateManager()
     ai = ai or SimpleNamespace(api_key="key", make_decision=AsyncMock(return_value=DecisionResult([], "", "", "test")),
         compose_reply=AsyncMock(return_value="Saved evidence reply"), compose_task_worker=AsyncMock(return_value="Worker evidence"))
+    if not hasattr(ai, "review_task_worker"):
+        async def review(payload):
+            identity = next(iter(payload["sources"]))
+            return {"claims": [{"text": "Worker evidence", "evidence": [
+                {"source_id": identity, "quote": payload["sources"][identity]["text"][:100]}]}]}
+        ai.review_task_worker = AsyncMock(side_effect=review)
     router = Router()
     service = TaskService(store, router, ai)
     registry = ToolRegistry()

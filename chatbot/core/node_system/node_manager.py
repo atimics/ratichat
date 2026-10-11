@@ -42,6 +42,9 @@ class NodeMetadata:
     last_summary_update_ts: Optional[float] = None
     last_expanded_ts: Optional[float] = None
     data_hash: Optional[str] = None
+    summary_source_hash: Optional[str] = None
+    summary_checked_at: Optional[float] = None
+    summary_links: List[str] = field(default_factory=list)
     
     def update_expanded_timestamp(self):
         """Update the last expanded timestamp to current time."""

@@ -108,6 +108,9 @@ class AwarenessStore:
                 target_platform TEXT, target_account TEXT, target_actor TEXT, token_hash TEXT,
                 stage TEXT, expires_at REAL, created_at REAL);
         """)
+        columns = {row["name"] for row in self._db.execute("PRAGMA table_info(awareness_nodes)")}
+        if "summary_checked_at" not in columns:
+            self._db.execute("ALTER TABLE awareness_nodes ADD COLUMN summary_checked_at REAL")
 
     @contextmanager
     def _transaction(self):
@@ -180,7 +183,8 @@ class AwarenessStore:
     @staticmethod
     def _node(row):
         data = json.loads(row["data_json"])
-        summary = row["summary"]
+        summary = row["summary"] if row["summary_version"] == row["version"] else ""
+        summary_checked_at = row["summary_checked_at"] if summary else row["updated_at"]
         if not summary:
             if row["kind"] == "conversation" and isinstance(data, dict):
                 summary = "; ".join(str(item.get("content", ""))[:180] for item in data.get("messages", [])[-3:])
@@ -191,6 +195,7 @@ class AwarenessStore:
             summary = " ".join(summary.split())[:700]
         return {"kind": row["kind"], "data": data, "summary": summary,
                 "version": row["version"], "summary_version": row["summary_version"] or row["version"], "valid": bool(row["valid"]),
+                "summary_checked_at": summary_checked_at,
                 "audience": {"kind": row["audience_kind"], "key": row["audience_key"]},
                 "evidence": json.loads(row["evidence_json"]), "updated_at": row["updated_at"]}
 
@@ -364,8 +369,8 @@ class AwarenessStore:
 
     def publish_summary(self, node_id, content_version, summary):
         with self._transaction() as db:
-            updated = db.execute("UPDATE awareness_nodes SET summary=?,summary_version=? WHERE id=? AND version=? AND valid=1",
-                                 (str(summary)[:1200], content_version, node_id, content_version))
+            updated = db.execute("UPDATE awareness_nodes SET summary=?,summary_version=?,summary_checked_at=? WHERE id=? AND version=? AND valid=1",
+                                 (str(summary)[:1200], content_version, self.clock(), node_id, content_version))
             return {"updated": bool(updated.rowcount), "conflict": not bool(updated.rowcount)}
 
     def snapshot_versions(self, platform, channel_id, sender_id, nodes, *, event_id=None):

@@ -121,6 +121,8 @@ async def test_new_request_keeps_saved_sources_in_its_channel_memory(tmp_path):
 async def test_lookup_budget_forces_a_final_reply_step(tmp_path):
     processor, ai, tools = make_processor(tmp_path, [
         decision(plan("web_search", query="one"), plan("read_webpage", url="https://example.com"), plan("read_feed", url="https://example.com/feed")),
+        decision(plan("read_webpage", url="https://example.com")),
+        decision(plan("read_feed", url="https://example.com/feed")),
         decision(plan("web_search", query="four"), plan("send_discord_reply", channel_id="20", reply_to_id="40", content="answer")),
     ])
     result = await processor.process_cycle("test", "20")

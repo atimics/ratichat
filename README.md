@@ -58,6 +58,26 @@ The system has been architected with a dynamic tool-based design for maximum ext
 - **AIDecisionEngine**: Updated to receive dynamic tool descriptions and optimized payloads
 - **Context Manager**: Advanced conversation context preservation and retrieval
 
+#### Source checks in the task loop
+
+The node loop runs one action per decision. The next decision sees that action's
+result. The existing step, lookup, and task cost limits still apply.
+
+Workers write a draft, then a separate model call checks it against the full
+request and available source data. The review returns supported claims or
+corrections with exact source quotes. The harness checks each quote before it
+saves the reviewed result. Each saved claim carries its source ID, content hash,
+links, and check time. Live worker reads become source dependencies for both
+the worker and its parent task. The review uses the same shared task budget.
+
+Collapsed summaries carry source versions, links, and check times. A source
+change refreshes its compact summary, including changes seen while the node
+is expanded. Saved summary check times survive a restart.
+
+The model judges whether a quote supports a claim. Exact quote checks confirm
+that the cited text appears in the saved source. Source quality and uncertain
+claims still need judgment when the final answer is written.
+
 #### **Platform Integrations**
 - **Matrix Integration**: Full Matrix protocol support with room management and invite handling
 - **Farcaster Integration**: Complete Farcaster API integration with enhanced user profiling

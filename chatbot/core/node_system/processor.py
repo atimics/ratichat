@@ -484,7 +484,7 @@ class NodeProcessor:
                     continue
                 watch_actions = [action for action in actions if action.action_type in STATE_TOOLS]
                 if watch_actions:
-                    for action in watch_actions:
+                    for action in watch_actions[:1]:
                         result = await self.executor._execute_action_and_return_result(action, scope)
                         prefix = "sources.task_result_" if action.action_type in TASK_TOOLS else "sources.proactive_result_" if action.action_type in PROACTIVE_SOURCE_TOOLS else "sources.watch_result_"
                         path = prefix + str(1 + sum(key.startswith(STATE_RESULT_PREFIXES) for key in sources))
@@ -507,7 +507,7 @@ class NodeProcessor:
                 # A reply selected alongside a lookup is based on stale context.
                 reads = [action for action in actions if action.action_type in READ_ONLY_SOURCE_TOOLS | NODE_TOOLS]
                 if reads and not final_step:
-                    for action in reads:
+                    for action in reads[:1]:
                         if action.action_type in NODE_TOOLS:
                             result = self.execute_node_action(action.action_type, action.parameters)
                             results.append({"tool": action.action_type, "result": result})
@@ -560,7 +560,7 @@ class NodeProcessor:
                 if self.policy.profile == "matrix_steward":
                     management = [action for action in actions if action.action_type in MANAGEMENT_TOOLS]
                     actions = management[:1] if management else actions
-                for action in actions:
+                for action in actions[:1]:
                     if action.action_type not in names:
                         continue
                     if action.action_type == "wait" and any(path.startswith(STATE_RESULT_PREFIXES) for path in sources):
