@@ -187,6 +187,12 @@ class NodeProcessor:
             self.research_store.fail(turn["id"], turn["delivery_token"], "Use the current message version",
                                      phase="delivery", retryable=False)
             return {"status": "blocked", "message": "Use the current message version."}
+        if self.awareness_store:
+            task = self.awareness_store.get_task_for_event(channel.type, channel.id, turn["event_id"])
+            if task and not self.awareness_store.inputs_current(task["id"]):
+                self.research_store.fail(turn["id"], turn["delivery_token"], "Use current source evidence",
+                                         phase="delivery", retryable=False)
+                return {"status": "blocked", "message": "Use current source evidence."}
         if self.participation_service and not self.participation_service.can_deliver(channel.type, channel.id, turn["event_id"]):
             self.research_store.fail(turn["id"], turn["delivery_token"], "The conversation has enough replies for now",
                                      phase="delivery", retryable=False)
@@ -421,6 +427,21 @@ class NodeProcessor:
             for step in range(self.MAX_STEPS):
                 if turn and not self.research_store.heartbeat(turn["id"], turn["lease_token"], lease_seconds=900):
                     return self._result(executed, lookups, step, failed=True)
+                self._check_inputs()
+                if self._binding:
+                    sources.update(self._binding.nodes)
+                    for path, data in list(sources.items()):
+                        if data.get("kind") == "task":
+                            current = self.awareness_store.get_node(path, channel.type, channel.id, source.sender)
+                            if current:
+                                sources[path] = current
+                            else:
+                                sources.pop(path)
+                        elif data.get("tool") == "run_task_workers":
+                            sources[path] = self.task_service.current_worker_results(data)
+                    for item in results:
+                        if item.get("tool") == "run_task_workers":
+                            item["result"] = self.task_service.current_worker_results(item["result"])
                 final_step = force_answer or step == self.MAX_STEPS - 1 or lookups >= self.MAX_LOOKUPS
                 names = allowed - READ_ONLY_SOURCE_TOOLS - TASK_TOOLS if final_step else allowed
                 payload = self.payload_builder.build_request_node_payload(channel, self.node_manager, sources)
@@ -478,6 +499,7 @@ class NodeProcessor:
                     result = await self._save_and_send(reply, scope, turn, sources)
                     return self._result(executed + 1, lookups, step + 1, failed=failed or result.get("status") != "success")
                 decision = await self.ai_engine.make_decision(payload, f"{cycle_id}_step_{step}")
+                self._check_inputs()
                 actions = decision.selected_actions[:3]
                 if not actions:
                     force_answer = True
@@ -544,8 +566,9 @@ class NodeProcessor:
                                 node_id = shared_source["node_id"]
                                 self._binding.nodes[node_id] = {k: v for k, v in shared_source.items() if k != "node_id"}
                                 self._binding.fresh_nodes.add(node_id)
-                                self._binding.input_versions = self.awareness_store.snapshot_versions(
+                                versions = self.awareness_store.snapshot_versions(
                                     channel.type, channel.id, source.sender, {k: v for k, v in self._binding.nodes.items() if v["kind"] != "task"}, event_id=source.id)
+                                self._binding.input_versions = {**self._binding.input_versions, **versions}
                                 self.awareness_store.save_route(self._binding.task["id"], self._binding.route,
                                     input_versions=self._binding.input_versions)
                             if turn and result.get("status") == "success":
@@ -605,3 +628,7 @@ class NodeProcessor:
     def _result(self, executed, lookups, steps, failed=False):
         self.last_result = {"actions_executed": executed, "lookups": lookups, "steps": steps, "failed": failed}
         return self.last_result
+
+    def _check_inputs(self):
+        if self._binding and not self.awareness_store.inputs_current(self._binding.task["id"], self._binding.input_versions):
+            raise ValueError("Use current source evidence before the next action.")

@@ -3,12 +3,15 @@
 import copy
 import json
 from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 import pytest
+import httpx
 
 from chatbot.core.node_system.evidence import check_worker_review, worker_sources
 from chatbot.core.node_system.node_manager import NodeManager
 from chatbot.core.node_system.awareness_store import AwarenessStore
+from chatbot.core.ai_engine import AIDecisionEngine
 from tests.test_node_processor import make_processor, decision, plan
 from tests.test_shared_task_runtime import setup, message
 
@@ -94,6 +97,67 @@ async def test_source_edit_during_review_rejects_worker_result(tmp_path):
     assert store.get_task(result["task_id"])["result"] is None
 
 
+@pytest.mark.asyncio
+async def test_worker_refresh_updates_parent_and_invalidates_earlier_claims(tmp_path):
+    processor, service, store, ai, _ = setup(tmp_path)
+    source = message(processor, store, "discord", "general", "owner", "d1", "Review the original alert")
+    params = {"url": "https://example.com"}
+    old = store.source_result("discord", "general", "owner", "read_webpage", params,
+                              {"status": "success", "content": "Old page evidence"})
+    binding = await service.prepare(processor.world_state.get_channel("general"), source)
+    live = AsyncMock(return_value={"status": "success", "content": "New page evidence"})
+    registry = processor.executor.tool_registry
+    registry.register_tool(SimpleNamespace(name="read_webpage", description="Read", parameters_schema={"url": "string"}, execute=live))
+    service.configure_read_tools(registry, processor.executor.action_context, processor.policy)
+    ai.plan_task_worker = AsyncMock(side_effect=[{"tool": "read_webpage", "parameters": params}, {"tool": None}])
+    async def review(payload):
+        assert "Old page evidence" not in json.dumps(payload["sources"])
+        return {"claims": [{"text": "New page evidence", "evidence": [
+            {"source_id": "lookup:0", "quote": "New page evidence"}]}]}
+    ai.review_task_worker = AsyncMock(side_effect=review)
+    result = await service._worker(binding, {"goal": "Read current page"}, 0)
+    assert result["review_status"] == "source_checked"
+    assert binding.input_versions[old["node_id"]] > old["version"]
+    assert "New page evidence" in json.dumps(binding.nodes[old["node_id"]])
+    assert store.inputs_current(binding.task["id"])
+    assert service.current_worker_results({"workers": [result]})["workers"][0]["content"] == "New page evidence"
+    store.source_result("discord", "general", "owner", "read_webpage", params,
+                        {"status": "success", "content": "Later correction"})
+    stale = service.current_worker_results({"workers": [result]})["workers"][0]
+    assert stale["status"] == "retry" and "content" not in stale
+    assert not store.inputs_current(binding.task["id"])
+
+
+@pytest.mark.asyncio
+async def test_source_edit_after_planning_stops_the_action(tmp_path):
+    from chatbot.core.ai_engine import ActionPlan, DecisionResult
+    processor, service, store, ai, sends = setup(tmp_path)
+    message(processor, store, "discord", "general", "owner", "d1", "Review the original alert")
+
+    async def choose(payload, cycle):
+        store.edit_message("discord", "general", "d1", {"sender": "owner", "content": "Review the corrected alert", "source_revision": 2})
+        return DecisionResult([ActionPlan("send_discord_reply", {"channel_id": "general", "reply_to_id": "d1", "content": "Old answer"}, "test", 1)], "", "", "test")
+
+    ai.make_decision.side_effect = choose
+    assert (await processor.process_cycle("edit", "general"))["failed"]
+    sends["send_discord_reply"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_source_edit_after_composition_stops_delivery(tmp_path):
+    processor, service, store, ai, sends = setup(tmp_path)
+    message(processor, store, "discord", "general", "owner", "d1", "Review the original alert")
+    store.put_node("source", "source", {"content": "Original page"}, "discord", "general", "owner")
+
+    async def compose(payload):
+        store.put_node("source", "source", {"content": "Corrected page"}, "discord", "general", "owner")
+        return "Answer based on original page"
+
+    ai.compose_reply.side_effect = compose
+    assert (await processor.process_cycle("edit", "general"))["failed"]
+    sends["send_discord_reply"].assert_not_awaited()
+
+
 def test_worker_sources_use_original_data_and_keep_source_metadata():
     sources = worker_sources({"source_event_id": "one", "original_request": "Read the original alert",
         "nodes": {"collapsed": {"summary": "DRAFT FACT", "kind": "source"},
@@ -151,3 +215,49 @@ def test_saved_summary_keeps_its_check_time_across_restart(tmp_path):
     assert "Edited page" in refreshed["summary"]
     assert store.publish_summary("source", node["version"], "Old summary")["conflict"]
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_worker_requires_review_before_reuse(tmp_path):
+    processor, service, store, ai, _ = setup(tmp_path)
+    source = message(processor, store, "discord", "general", "owner", "d1", "Review the original alert")
+    binding = await service.prepare(processor.world_state.get_channel("general"), source)
+    result = await service._worker(binding, {"goal": "Review facts"}, 0)
+    child_id = result["task_id"]
+    store.record_result(child_id, {"kind": "worker", "content": "LEGACY DRAFT CLAIM"}, input_versions=binding.input_versions)
+    assert "LEGACY DRAFT CLAIM" not in json.dumps(store.get_node("tasks." + child_id, "discord", "general", "owner"))
+    assert "LEGACY DRAFT CLAIM" not in json.dumps(service.task_context(store.get_task(child_id)))
+    ai.review_task_worker.reset_mock()
+    result = await service._worker(binding, {"goal": "Review facts"}, 0)
+    ai.review_task_worker.assert_awaited_once()
+    assert result["review_status"] == "source_checked"
+
+
+@pytest.mark.asyncio
+async def test_review_call_uses_shared_budget_and_saves_usage(tmp_path, monkeypatch):
+    processor, service, store, ai, _ = setup(tmp_path)
+    source = message(processor, store, "discord", "general", "owner", "d1", "Review the original alert")
+    binding = await service.prepare(processor.world_state.get_channel("general"), source)
+    review = {"claims": [{"text": "The request contains an alert", "evidence": [
+        {"source_id": "request:d1", "quote": "original alert"}]}]}
+    client_type = httpx.AsyncClient
+    requests = []
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"model": requests[-1]["model"], "choices": [{"message": {"content": json.dumps(review)}}],
+            "usage": {"cost": 0.004}})
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client_type(transport=httpx.MockTransport(respond), **kwargs))
+    ai.review_task_worker = AIDecisionEngine("test").review_task_worker
+    result = await service._worker(binding, {"goal": "Check alert"}, 0)
+    assert result["review_status"] == "source_checked"
+    assert len(requests) == 1
+    assert store.get_task(binding.task["id"])["spent_usd"] >= 0.004
+    assert store.get_task(binding.task["id"])["reserved_usd"] == 0
+    root = store.get_task(binding.task["id"])
+    hold = store.reserve_attempt(root["id"], root["remaining_usd"] - 0.00001, "other-work")
+    with service.activate(binding):
+        assert await ai.review_task_worker({"sources": {}}) is None
+    assert len(requests) == 1
+    store.record_result(root["id"], {}, attempt_id=hold["id"], cost_usd=0, success=False, status="active")

@@ -106,7 +106,9 @@ class TaskService:
                 if isinstance(result, dict):
                     if result.get("status") == "success":
                         source = self.store.source_result(binding.platform, binding.channel_id, binding.sender_id, name, params, result)
+                        payload["nodes"][source["node_id"]] = source
                         binding.input_versions[source["node_id"]] = source["version"]
+                        binding.fresh_nodes.add(source["node_id"])
                         if not self.store.save_route(binding.task["id"], binding.route, input_versions=binding.input_versions).get("saved"):
                             raise ValueError("Use current worker source versions.")
                         payload["tool_results"][-1].update({"source_id": source["node_id"], "version": source["version"]})
@@ -123,15 +125,38 @@ class TaskService:
         })
         return check_worker_review(review, sources, checked_at)
 
-    def _adopt_worker(self, parent, versions):
+    def _adopt_worker(self, parent, versions, fresh_nodes=()):
         """Make the parent depend on every source used by an accepted worker."""
-        if any(key in parent.input_versions and parent.input_versions[key] != value for key, value in versions.items()):
+        if any(key in parent.input_versions and parent.input_versions[key] != value and key not in fresh_nodes
+               for key, value in versions.items()):
             return False
         inputs = {**parent.input_versions, **versions}
+        refreshed = {}
+        for path in fresh_nodes:
+            node = self.store.get_node(path, parent.platform, parent.channel_id, parent.sender_id)
+            if not node or node["version"] != versions[path]:
+                return False
+            refreshed[path] = node
         if not self.store.save_route(parent.task["id"], parent.route, input_versions=inputs).get("saved"):
             return False
         parent.input_versions = inputs
+        parent.nodes.update(refreshed)
+        parent.fresh_nodes.update(refreshed)
         return True
+
+    def current_worker_results(self, result):
+        """Expose reviewed claims while their saved source versions are current."""
+        workers = []
+        for worker in result.get("workers", []):
+            task_id = worker.get("task_id")
+            task = self.store.get_task(task_id) if task_id else None
+            checked = task and task.get("result") or {}
+            if (task and task["status"] == "complete" and checked.get("review_status") == "source_checked"
+                    and self.store.inputs_current(task_id)):
+                workers.append({"task_id": task_id, **checked, "saved": True})
+            else:
+                workers.append({"task_id": task_id, "status": "retry", "message": "This worker needs a current source review."})
+        return {**result, "workers": workers}
 
     async def prepare(self, channel, source, *, proactive=False):
         nodes = self.store.catalog(channel.type, channel.id, source.sender, query=source.content)
@@ -231,7 +256,8 @@ class TaskService:
         result["route"] = {k: route[k] for k in ("model", "persona", "topic", "catalog_version") if k in route}
         if history:
             result["results"] = [{"status": item["status"], "result": json.dumps(item["result"])[:1800]}
-                                 for item in task.get("results", [])[-3:]]
+                                 for item in task.get("results", [])[-3:]
+                                 if item["result"].get("kind") != "worker" or item["result"].get("review_status") == "source_checked"]
         return result
 
     async def execute_tool(self, name, params, scope):
@@ -319,7 +345,7 @@ class TaskService:
             if result:
                 saved = self.store.record_result(child["id"], result,
                     input_versions=binding.input_versions)
-                if saved.get("accepted") and self._adopt_worker(parent, binding.input_versions):
+                if saved.get("accepted") and self._adopt_worker(parent, binding.input_versions, binding.fresh_nodes):
                     return {"task_id": child["id"], **result, "saved": saved}
             return {"task_id": child["id"], "status": "retry", "message": "This worker needs a source review."}
         except (ValueError, PermissionError, asyncio.TimeoutError):

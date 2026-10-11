@@ -39,3 +39,15 @@ async def test_worker_accepts_complete_json_in_fences_and_handles_unfinished_jso
     engine._post = AsyncMock(side_effect=[response('```json\n{"tool":null}\n```'), response('{"tool":')])
     assert await engine.plan_task_worker({}) == {"tool": None}
     assert await engine.plan_task_worker({}) is None
+
+
+@pytest.mark.asyncio
+async def test_worker_review_reads_claims_with_nested_source_quotes():
+    engine = AIDecisionEngine("test")
+    review = {"claims": [{"text": "The source includes the address", "evidence": [
+        {"source_id": "request:one", "quote": "0x" + "a" * 40}]}]}
+    engine._post = AsyncMock(side_effect=[response("```json\n" + json.dumps(review) + "\n```"), response('{"claims":')])
+    assert await engine.review_task_worker({"draft": "Missing address"}) == review
+    assert await engine.review_task_worker({}) is None
+    prompt = engine._post.call_args.kwargs["json"]["messages"][0]["content"]
+    assert "Correct claims that conflict with the sources" in prompt

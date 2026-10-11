@@ -42,8 +42,12 @@ def worker_sources(payload, checked_at):
         if node.get("kind") != "task" and "data" in node:
             add("node:" + path, node["data"], version=node.get("version"),
                 fetched_at=node["data"].get("fetched_at") if isinstance(node["data"], dict) else None)
-    for index, item in enumerate(payload.get("tool_results", [])):
+    lookups = payload.get("tool_results", [])
+    latest = {item["source_id"]: item["version"] for item in lookups if item.get("source_id")}
+    for index, item in enumerate(lookups):
         result = item.get("result")
+        if item.get("source_id") and item.get("version") != latest[item["source_id"]]:
+            continue
         if isinstance(result, dict) and result.get("status") == "success":
             add(f"lookup:{index}", result, tool=item["tool"], fetched_at=item.get("fetched_at"),
                 node_id=item.get("source_id"), version=item.get("version"))

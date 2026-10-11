@@ -582,10 +582,11 @@ Be thoughtful about when to act vs when to wait and observe. The `wait` tool mea
         logger.info(f"AIDecisionEngine: Starting decision cycle {cycle_id}")
 
         # Construct the prompt
+        action_limit = 1 if world_state.get("processing_mode") == "node_based" else self.max_actions_per_cycle
         user_prompt = f"""Current World State:
 {json.dumps(world_state, indent=2)}
 
-Based on this world state, what actions (if any) should you take? Remember you can take up to {self.max_actions_per_cycle} actions this cycle, or choose to wait and observe."""
+Based on this world state, what actions (if any) should you take? Choose up to {action_limit} actions this cycle, or choose to wait and observe."""
 
         system_prompt = self.system_prompt
         if world_state.get("processing_mode") == "node_based":
