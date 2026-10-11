@@ -31,9 +31,9 @@ class MatrixServerStatusTool(MatrixManagementTool):
 
 class ManageMatrixRoomTool(MatrixManagementTool):
     name = "manage_matrix_room"
-    description = "Update a managed public room after an operator asks in the control room. Operations: name, topic, publish, unpublish. Use one action per requested change."
+    description = "Update a managed public room under the authority in community_control. Operations: name, topic, publish, unpublish. Use one action per requested change."
     parameters_schema = {
-        "source_event_id": "string - Latest operator request event ID",
+        "source_event_id": "string - Current source event ID from community_control",
         "room_id": "string - Configured managed public room ID",
         "operation": "string - name, topic, publish, or unpublish",
         "value": "string - New name or topic; used for those two operations",
@@ -45,9 +45,9 @@ class ManageMatrixRoomTool(MatrixManagementTool):
 
 class ManageMatrixServerTool(MatrixManagementTool):
     name = "manage_matrix_server"
-    description = "Ask the Matrix server for uptime, memory, backup, or list_backups after an operator request in the control room. Report the returned server message; a pending receipt means the result still needs checking."
+    description = "Ask the Matrix server for uptime, memory, backup, or list_backups under the authority in community_control. Report the returned server message; a pending receipt means the result still needs checking."
     parameters_schema = {
-        "source_event_id": "string - Latest operator request event ID",
+        "source_event_id": "string - Current source event ID from community_control",
         "operation": "string - uptime, memory, backup, or list_backups",
     }
 

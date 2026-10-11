@@ -11,7 +11,7 @@ import time
 
 from ...config import settings
 from ..ai_engine import ActionPlan
-from ..orchestration.capability_policy import READ_ONLY_SOURCE_TOOLS, SOURCE_WATCH_TOOLS, PROACTIVE_SOURCE_TOOLS, STATE_TOOLS, TASK_TOOLS, MANAGEMENT_TOOLS, MANAGEMENT_WRITE_TOOLS
+from ..orchestration.capability_policy import READ_ONLY_SOURCE_TOOLS, SOURCE_WATCH_TOOLS, PROACTIVE_SOURCE_TOOLS, STATE_TOOLS, TASK_TOOLS, MANAGEMENT_TOOLS, MANAGEMENT_WRITE_TOOLS, ADMIN_READ_TOOLS
 from .interaction_tools import NodeInteractionTools
 from .node_manager import NodeManager
 from .research_store import ResearchStore
@@ -271,7 +271,11 @@ class NodeProcessor:
             if own_message(source):
                 return self._result(0, 0, 0)
             if self.participation_service and source.metadata.get("conversation_candidate"):
-                decision = await self.participation_service.evaluate(channel, source)
+                control = self.policy.control_context(self.policy.scope_from_payload({
+                    "current_processing_channel_id": channel.id, "channels": {channel.id: {
+                        "type": channel.type, "recent_messages": [{"id": source.id, "sender": source.sender}]}}}))
+                decision = await self.participation_service.evaluate(channel, source,
+                    **({"community_control": control} if self.policy.ai_control_enabled else {}))
                 self._participation = {k: decision[k] for k in ("join", "topic", "reason")}
                 if not decision["join"]:
                     if turn:
@@ -418,6 +422,7 @@ class NodeProcessor:
         if turn:
             allowed &= READ_ONLY_SOURCE_TOOLS | STATE_TOOLS | REPLY_TOOLS | MANAGEMENT_TOOLS | {"wait"}
         lookups, executed = 0, 0
+        control_reads = ADMIN_READ_TOOLS if self.policy.ai_control_enabled else frozenset()
         results = [{"tool": data["tool"], "node_path": path, "result": data}
                    for path, data in sources.items() if path.startswith(STATE_RESULT_PREFIXES)]
         seen_lookups = set()
@@ -442,7 +447,7 @@ class NodeProcessor:
                         if item.get("tool") == "run_task_workers":
                             item["result"] = self.task_service.current_worker_results(item["result"])
                 final_step = force_answer or step == self.MAX_STEPS - 1 or lookups >= self.MAX_LOOKUPS
-                names = allowed - READ_ONLY_SOURCE_TOOLS - TASK_TOOLS if final_step else allowed
+                names = allowed - READ_ONLY_SOURCE_TOOLS - TASK_TOOLS - control_reads if final_step else allowed
                 payload = self.payload_builder.build_request_node_payload(channel, self.node_manager, sources)
                 if self._participation:
                     payload["participation"] = self._participation
@@ -469,6 +474,7 @@ class NodeProcessor:
                         "request_event_id": scope.latest_event_id,
                         "managed_room_ids": sorted(self.policy.managed_room_ids),
                     }
+                payload["community_control"] = self.policy.control_context(scope)
                 self.last_payload = copy.deepcopy(payload)
                 if final_step:
                     # Include the bounded source data even when the planner has
@@ -526,7 +532,7 @@ class NodeProcessor:
                     # The next AI step sees the actual result before writing its reply.
                     continue
                 # A reply selected alongside a lookup is based on stale context.
-                reads = [action for action in actions if action.action_type in READ_ONLY_SOURCE_TOOLS | NODE_TOOLS]
+                reads = [action for action in actions if action.action_type in READ_ONLY_SOURCE_TOOLS | control_reads | NODE_TOOLS]
                 if reads and not final_step:
                     for action in reads[:1]:
                         if action.action_type in NODE_TOOLS:
@@ -541,7 +547,7 @@ class NodeProcessor:
                         lookups += 1
                         parameters = dict(action.parameters)
                         fresh = parameters.pop("fresh", False)
-                        cached = self.research_store.cached_source(channel.type, channel.id, action.action_type, parameters) if turn and not fresh and action.action_type != "check_onchain_activity" else None
+                        cached = self.research_store.cached_source(channel.type, channel.id, action.action_type, parameters) if turn and not fresh and action.action_type not in control_reads | {"check_onchain_activity"} else None
                         if cached:
                             result = {**cached["result"], "cached": True, "fetched_at": cached["fetched_at"], "expires_at": cached["expires_at"]}
                         else:
@@ -559,7 +565,7 @@ class NodeProcessor:
                                     {"kind": "source_read", "tool": action.action_type, "status": result.get("status"),
                                      "cost_source": "provider" if result.get("usage", {}).get("cost") is not None else "reserved_bound"},
                                     attempt_id=lookup_attempt["id"], cost_usd=cost, status="active")
-                            if self._binding and result.get("status") == "success":
+                            if self._binding and result.get("status") == "success" and action.action_type not in control_reads:
                                 shared_source = self.awareness_store.source_result(channel.type, channel.id, source.sender,
                                     action.action_type, parameters, result)
                                 node_id = shared_source["node_id"]
@@ -570,7 +576,7 @@ class NodeProcessor:
                                 self._binding.input_versions = {**self._binding.input_versions, **versions}
                                 self.awareness_store.save_route(self._binding.task["id"], self._binding.route,
                                     input_versions=self._binding.input_versions)
-                            if turn and result.get("status") == "success":
+                            if turn and result.get("status") == "success" and action.action_type not in control_reads:
                                 self.research_store.save_source(channel.type, channel.id, action.action_type, parameters, result, ttl_seconds=settings.RESEARCH_SOURCE_TTL_SECONDS)
                         path = f"sources.result_{lookups}"
                         sources[path] = {"tool": action.action_type, "trust": "untrusted_source", **result}
@@ -584,7 +590,7 @@ class NodeProcessor:
                 for action in actions[:1]:
                     if action.action_type not in names:
                         continue
-                    if action.action_type == "wait" and any(path.startswith(STATE_RESULT_PREFIXES) for path in sources):
+                    if action.action_type == "wait" and ("sources.result_control" in sources or any(path.startswith(STATE_RESULT_PREFIXES) for path in sources)):
                         force_answer = True
                         break
                     if turn and action.action_type in REPLY_TOOLS:
@@ -596,6 +602,16 @@ class NodeProcessor:
                                     return self._result(executed, lookups, step + 1, failed=True)
                         result = await self.executor._execute_action_and_return_result(action, scope)
                     executed += 1
+                    if action.action_type in MANAGEMENT_TOOLS and self.policy.ai_control_enabled:
+                        path = "sources.result_control"
+                        sources[path] = {"tool": action.action_type, "trust": "tool_result", **result}
+                        self.node_manager.expand_node(path)
+                        results.append({"tool": action.action_type, "node_path": path, "result": result})
+                        # Each observed event has one write. The AI can inspect
+                        # the changed state and compose its reply in later steps.
+                        allowed -= MANAGEMENT_WRITE_TOOLS
+                        seen_lookups.clear()
+                        continue
                     if action.action_type in MANAGEMENT_TOOLS:
                         content = result.get("message", result.get("error", "Admin action finished"))
                         if result.get("receipt_id"):

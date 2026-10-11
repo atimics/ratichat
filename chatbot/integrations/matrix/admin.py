@@ -5,7 +5,7 @@ from urllib.parse import quote
 
 import httpx
 
-from ..admin_actions import AdminReceipts, integer_value, text_value, result_message
+from ..admin_actions import AdminReceipts, integer_value, text_value, result_message, check_ai_control
 
 
 class MatrixRoomAdmin:
@@ -15,7 +15,7 @@ class MatrixRoomAdmin:
         self.receipts = AdminReceipts(steward.db_path)
         self.lock = asyncio.Lock()
 
-    async def execute(self, tool, params, scope, observer):
+    async def execute(self, tool, params, scope, observer, *, autonomous=False):
         room_id = params.get("room_id")
         allowed = {room.strip() for room in self.config.MATRIX_MANAGED_ROOM_IDS.split(",") if room.strip()}
         if room_id not in allowed or room_id in {self.config.MATRIX_CONTROL_ROOM_ID, self.config.MATRIX_ADMIN_ROOM_ID}:
@@ -23,9 +23,13 @@ class MatrixRoomAdmin:
         if not observer or not observer.client or not observer.client.access_token:
             raise ValueError("Connect the Matrix bot first")
         operators = {user.strip() for user in self.config.MATRIX_OPERATOR_USER_IDS.split(",") if user.strip()}
-        if (not scope or scope.channel_type != "matrix" or scope.channel_id != self.config.MATRIX_CONTROL_ROOM_ID
-                or scope.latest_sender_id not in operators or not scope.latest_event_id
-                or params.get("source_event_id") != scope.latest_event_id):
+        if autonomous:
+            check_ai_control(self.config, tool, params)
+        approved = {room.strip() for room in self.config.PUBLIC_MATRIX_ROOM_IDS.split(",") if room.strip()}
+        if (not scope or scope.channel_type != "matrix" or not scope.latest_event_id
+                or params.get("source_event_id") != scope.latest_event_id
+                or (autonomous and (scope.channel_id not in approved or scope.channel_id not in {room_id, self.config.MATRIX_CONTROL_ROOM_ID}))
+                or (not autonomous and (scope.channel_id != self.config.MATRIX_CONTROL_ROOM_ID or scope.latest_sender_id not in operators))):
             raise ValueError("Use a current operator request in the Matrix control room")
         room = "/_matrix/client/v3/rooms/" + quote(room_id, safe="")
         async with self.lock, self.steward._client(observer.client.access_token) as client:
@@ -34,7 +38,7 @@ class MatrixRoomAdmin:
                 + "/event/" + quote(scope.latest_event_id, safe=""))
             source.raise_for_status()
             event = source.json()
-            if (event.get("sender") != scope.latest_sender_id or event.get("type") != "m.room.message"
+            if (event.get("sender") != scope.latest_sender_id or event.get("sender") == self.config.MATRIX_USER_ID or event.get("type") != "m.room.message"
                     or not event.get("content", {}).get("body")):
                 raise ValueError("Use a current operator message in the control room")
             if tool == "inspect_matrix_room":

@@ -1,11 +1,11 @@
-"""Owner-requested Discord admin actions with live permission checks."""
+"""Discord controls using the AI bot role or a verified owner request."""
 
 import asyncio
 from datetime import timedelta
 
 import discord
 
-from ..admin_actions import AdminReceipts, integer_value, text_value, result_message
+from ..admin_actions import AdminReceipts, integer_value, text_value, result_message, check_ai_control
 
 
 def snowflake(value, label):
@@ -20,10 +20,12 @@ class DiscordAdmin:
         self.receipts = AdminReceipts(db_path)
         self.lock = asyncio.Lock()
 
-    async def execute(self, tool, params, scope, observer):
+    async def execute(self, tool, params, scope, observer, *, autonomous=False):
         owners = {value.strip() for value in self.config.DISCORD_OWNER_USER_IDS.split(",") if value.strip()}
-        if (not self.config.DISCORD_ADMIN_ENABLED or not scope or scope.channel_type != "discord"
-                or scope.latest_sender_id not in owners or not scope.latest_event_id
+        if autonomous:
+            check_ai_control(self.config, tool, params)
+        if (not (self.config.DISCORD_ADMIN_ENABLED or autonomous) or not scope or scope.channel_type != "discord"
+                or (not autonomous and scope.latest_sender_id not in owners) or not scope.latest_event_id
                 or params.get("source_event_id") != scope.latest_event_id):
             raise ValueError("Use a current owner request with Discord admin tools enabled")
         if not observer or not observer.client or not observer.client.is_ready():
@@ -42,12 +44,13 @@ class DiscordAdmin:
             if (not request or request != (scope.channel_id, str(source.author.id),
                                            observer._content(source.content, source.embeds))
                     or str(source.author.id) != scope.latest_sender_id
-                    or source.author.bot or source.webhook_id
-                    or not any(user.id == observer.client.user.id for user in source.mentions)):
+                    or source.author.id == observer.client.user.id
+                    or (not autonomous and (source.author.bot or source.webhook_id
+                        or not any(user.id == observer.client.user.id for user in source.mentions)))):
                 raise ValueError("Send a fresh owner request that mentions the bot")
             guild = channel.guild
-            actor = await guild.fetch_member(source.author.id)
             bot = await guild.fetch_member(observer.client.user.id)
+            actor = bot if autonomous else await guild.fetch_member(source.author.id)
             self.require_permission(actor, bot, "view_channel", channel)
             if tool == "inspect_discord_server":
                 return await self.inspect(guild, channel, actor, bot, params, observer)
@@ -55,7 +58,8 @@ class DiscordAdmin:
             if previous:
                 return previous
             reason = text_value(params.get("reason"), "reason", 300)
-            audit_reason = f"RatiChat request {source.id} by {actor.id}: {reason}"
+            audit_reason = (f"RatiChat AI at event {source.id}: {reason}" if autonomous
+                            else f"RatiChat request {source.id} by {actor.id}: {reason}")
             operation = params.get("operation")
             action = await self.prepare(tool, params, guild, channel, actor, bot, owners, audit_reason)
             receipt_id, previous = self.receipts.reserve("discord", scope.channel_id, scope.latest_event_id, tool, params)

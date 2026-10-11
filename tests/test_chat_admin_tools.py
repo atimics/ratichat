@@ -379,3 +379,112 @@ async def test_traditional_processor_reports_actual_discord_result():
     context.discord_admin.execute.assert_awaited_once()
     assert reply.execute.await_args.args[0]["content"] == "Topic updated\n\nReceipt: receipt12345"
     assert reply.execute.await_args.args[0]["channel_id"] == "20"
+
+
+def ai_policy(*, moderation=False):
+    return CapabilityPolicy("matrix_steward", [ROOM, CONTROL], CONTROL, [OWNER], [ROOM], ["20"], ["50"],
+                            discord_admin_enabled=True, ai_control_enabled=True, ai_moderation_enabled=moderation)
+
+
+@pytest.mark.parametrize("tool,params,scope", [
+    ("inspect_matrix_room", {"room_id": ROOM}, replace(MATRIX_SCOPE, channel_id=ROOM, latest_sender_id="@guest:test")),
+    ("manage_matrix_room", {"room_id": ROOM, "operation": "topic"}, replace(MATRIX_SCOPE, channel_id=ROOM, latest_sender_id="@guest:test")),
+    ("manage_matrix_message", {"room_id": ROOM, "operation": "pin"}, replace(MATRIX_SCOPE, channel_id=ROOM, latest_sender_id="@guest:test")),
+    ("manage_discord_channel", {"operation": "topic"}, replace(DISCORD_SCOPE, latest_sender_id="60")),
+    ("manage_discord_message", {"operation": "pin"}, replace(DISCORD_SCOPE, latest_sender_id="60")),
+    ("inspect_discord_server", {}, replace(DISCORD_SCOPE, latest_sender_id="60")),
+])
+def test_ai_role_grants_routine_control_from_community_events(tool, params, scope):
+    p = ai_policy()
+    params = {**params, "source_event_id": scope.latest_event_id}
+    assert tool in p.filter_tool_names({tool}, scope)
+    assert p.denial_reason(tool, params, scope) is None
+    assert p.ai_controls(tool, params, scope)
+    assert p.denial_reason(tool, {**params, "source_event_id": "old"}, scope)
+    assert p.denial_reason(tool, params, replace(scope, channel_id="other"))
+    assert not p.ai_controls(tool, params, replace(scope, channel_id="other"))
+    assert p.control_context(scope)["mode"] == "ai"
+
+
+@pytest.mark.parametrize("tool,operation,scope", [
+    ("moderate_matrix_member", "ban", replace(MATRIX_SCOPE, channel_id=ROOM, latest_sender_id="@guest:test")),
+    ("manage_matrix_message", "redact", replace(MATRIX_SCOPE, channel_id=ROOM, latest_sender_id="@guest:test")),
+    ("moderate_discord_member", "timeout", replace(DISCORD_SCOPE, latest_sender_id="60")),
+    ("manage_discord_role", "add", replace(DISCORD_SCOPE, latest_sender_id="60")),
+    ("manage_discord_message", "delete", replace(DISCORD_SCOPE, latest_sender_id="60")),
+])
+def test_ai_moderation_follows_its_configured_authority(tool, operation, scope):
+    params = {"source_event_id": scope.latest_event_id, "room_id": ROOM, "operation": operation}
+    assert ai_policy().denial_reason(tool, params, scope)
+    assert ai_policy(moderation=True).denial_reason(tool, params, scope) is None
+
+
+def test_matrix_ai_actions_stay_in_current_room():
+    p = ai_policy()
+    p.managed_room_ids |= {"!other:test"}
+    scope = replace(MATRIX_SCOPE, channel_id=ROOM, latest_sender_id="@guest:test")
+    assert p.denial_reason("manage_matrix_room", {"room_id": "!other:test", "source_event_id": "$request"}, scope)
+
+
+@pytest.mark.asyncio
+async def test_discord_ai_uses_bot_authority_without_owner_mention(discord_admin):
+    d = discord_admin
+    d.admin.config.AI_CHAT_CONTROL_ENABLED = True
+    d.source.author.id, d.source.mentions = 60, []
+    d.observer._requests["40"] = ("20", "60", d.source.content)
+    scope = replace(DISCORD_SCOPE, latest_sender_id="60")
+    result = await d.admin.execute("manage_discord_channel", discord_params(operation="topic", value="Community"), scope, d.observer, autonomous=True)
+    assert result["status"] == "success"
+    assert d.channel.edit.await_args.kwargs["reason"].startswith("RatiChat AI at event 40:")
+    assert [call.args[0] for call in d.guild.fetch_member.await_args_list] == [30]
+
+
+@pytest.mark.asyncio
+async def test_discord_ai_still_checks_bot_permission(discord_admin):
+    d = discord_admin
+    d.admin.config.AI_CHAT_CONTROL_ENABLED = True
+    d.bot.guild_permissions = discord.Permissions(view_channel=True)
+    with pytest.raises(ValueError, match="manage_channels"):
+        await d.admin.execute("manage_discord_channel", discord_params(operation="topic", value="Community"), DISCORD_SCOPE, d.observer, autonomous=True)
+    d.channel.edit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_discord_ai_can_moderate_source_member_when_enabled(discord_admin, enabled):
+    d = discord_admin
+    d.admin.config.AI_CHAT_CONTROL_ENABLED = True
+    d.admin.config.AI_CHAT_MODERATION_ENABLED = enabled
+    d.source.author.id, d.source.mentions = 60, []
+    d.observer._requests["40"] = ("20", "60", d.source.content)
+    scope = replace(DISCORD_SCOPE, latest_sender_id="60")
+    params = discord_params(operation="timeout", user_id="60", seconds=60)
+    if enabled:
+        result = await d.admin.execute("moderate_discord_member", params, scope, d.observer, autonomous=True)
+        assert result["status"] == "success"
+        d.member.timeout.assert_awaited_once()
+    else:
+        with pytest.raises(ValueError, match="owner request"):
+            await d.admin.execute("moderate_discord_member", params, scope, d.observer, autonomous=True)
+        d.member.timeout.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_matrix_ai_inspects_and_pins_from_public_conversation(matrix):
+    admin, observer, calls, state = matrix
+    admin.config.AI_CHAT_CONTROL_ENABLED = True
+    admin.config.PUBLIC_MATRIX_ROOM_IDS = ROOM
+    state["source_sender"] = "@guest:test"
+    scope = replace(MATRIX_SCOPE, channel_id=ROOM, latest_sender_id="@guest:test")
+    assert (await admin.execute("inspect_matrix_room", matrix_params(), scope, observer, autonomous=True))["status"] == "success"
+    assert (await admin.execute("manage_matrix_message", matrix_params(operation="pin", event_id="$target"), scope, observer, autonomous=True))["status"] == "success"
+    assert json.loads(next(call.content for call in calls if call.method == "PUT")) == {"pinned": ["$old", "$target"]}
+
+
+@pytest.mark.asyncio
+async def test_matrix_ai_keeps_moderation_with_owner_in_routine_mode(matrix):
+    admin, observer, calls, state = matrix
+    admin.config.AI_CHAT_CONTROL_ENABLED = True
+    with pytest.raises(ValueError, match="owner request"):
+        await admin.execute("moderate_matrix_member", matrix_params(operation="ban", user_id="@guest:test"), MATRIX_SCOPE, observer, autonomous=True)
+    assert calls == []

@@ -162,3 +162,16 @@ async def test_decision_sees_later_answers_and_one_current_event(tmp_path):
     assert state["conversation"][0]["is_ratichat"]
     assert all(n["id"] != "channels.discord.general" for n in state["shared_context"])
     service.close()
+
+
+@pytest.mark.asyncio
+async def test_community_control_is_passed_to_participation_model(tmp_path):
+    decisions = SimpleNamespace(decide=AsyncMock(return_value=receipt()))
+    service = ParticipationService(str(tmp_path / "participation.db"), decisions)
+    channel, source = event(bot=False)
+    control = {"mode": "ai", "moderation": "owner_request"}
+    assert (await service.evaluate(channel, source, community_control=control))["join"]
+    state, questions = decisions.decide.await_args.args
+    assert state["community_control"] == control
+    assert "moderation action" in questions["participation"]["instructions"]
+    service.close()

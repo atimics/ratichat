@@ -64,6 +64,8 @@ class CapabilityPolicy:
         approved_discord_channel_ids: Collection[str] = (),
         discord_owner_user_ids: Collection[str] = (),
         discord_admin_enabled: bool = False,
+        ai_control_enabled: bool = False,
+        ai_moderation_enabled: bool = False,
     ) -> None:
         normalized_profile = profile.strip().lower()
         if normalized_profile not in self.SUPPORTED_PROFILES:
@@ -73,6 +75,8 @@ class CapabilityPolicy:
             )
         self.profile = normalized_profile
         self.discord_admin_enabled = discord_admin_enabled
+        self.ai_control_enabled = ai_control_enabled
+        self.ai_moderation_enabled = ai_moderation_enabled
         self.approved_discord_channel_ids = frozenset(
             value.strip() for value in approved_discord_channel_ids if value.strip()
         )
@@ -89,7 +93,7 @@ class CapabilityPolicy:
     def allows(self, tool_name: str) -> bool:
         """Return whether this profile permits a model-selected tool."""
         if tool_name in DISCORD_ADMIN_TOOLS:
-            return self.discord_admin_enabled
+            return self.discord_admin_enabled or self.ai_control_enabled
         if self.profile == "operator":
             return True
         if self.profile == "matrix_steward":
@@ -105,7 +109,9 @@ class CapabilityPolicy:
             if self.allows(name) and (
                 name not in MATRIX_MANAGEMENT_TOOLS
                 or self._operator_scope(execution_scope)
-            ) and (name not in DISCORD_ADMIN_TOOLS or self._discord_admin_scope(execution_scope))
+                or self.ai_controls(name, {}, execution_scope)
+            ) and (name not in DISCORD_ADMIN_TOOLS or self._discord_admin_scope(execution_scope)
+                 or self.ai_controls(name, {}, execution_scope))
             and (name not in STATE_TOOLS or self._watch_scope(execution_scope))
             and (name not in PROACTIVE_SOURCE_TOOLS or execution_scope.channel_type == "discord")
             and (name not in WATCH_WRITE_TOOLS | PROACTIVE_WRITE_TOOLS or self._watch_owner_scope(execution_scope))
@@ -122,6 +128,29 @@ class CapabilityPolicy:
             return False
         owners = self.discord_owner_user_ids if scope.channel_type == "discord" else self.operator_user_ids
         return scope.latest_sender_id in owners
+
+    def ai_controls(self, tool_name, parameters, scope):
+        """The configured AI role grants authority; chat authors supply context."""
+        if not self.ai_control_enabled or tool_name not in MANAGEMENT_TOOLS or not self._watch_scope(scope):
+            return False
+        if scope.channel_type == "discord":
+            if tool_name not in DISCORD_ADMIN_TOOLS:
+                return False
+        elif scope.channel_type == "matrix":
+            if tool_name in DISCORD_ADMIN_TOOLS or scope.channel_id not in self.managed_room_ids | {self.control_room_id}:
+                return False
+        else:
+            return False
+        moderation = (tool_name in {"moderate_matrix_member", "moderate_discord_member", "manage_discord_role"}
+                      or parameters.get("operation") in {"delete", "redact"})
+        return self.ai_moderation_enabled or not moderation
+
+    def control_context(self, scope):
+        return {"mode": "ai" if self.ai_control_enabled else "owner_request",
+                "moderation": "ai" if self.ai_control_enabled and self.ai_moderation_enabled else "owner_request",
+                "source_event_id": scope.latest_event_id,
+                "channel_id": scope.channel_id,
+                "managed_matrix_room_ids": sorted(self.managed_room_ids) if scope.channel_type == "matrix" else []}
 
     def _discord_admin_scope(self, scope):
         return bool(self.discord_admin_enabled and scope and scope.channel_type == "discord"
@@ -186,7 +215,7 @@ class CapabilityPolicy:
                 f"'{self.profile}' capability profile"
             )
         if tool_name in DISCORD_ADMIN_TOOLS:
-            if not self._discord_admin_scope(execution_scope):
+            if not self._discord_admin_scope(execution_scope) and not self.ai_controls(tool_name, parameters, execution_scope):
                 return "Use a current Discord owner request in a configured channel"
             if parameters.get("source_event_id") != execution_scope.latest_event_id:
                 return "Use the latest Discord owner request message ID"
@@ -200,10 +229,16 @@ class CapabilityPolicy:
                 return "Use an approved Matrix room"
             if not execution_scope.latest_event_id or parameters.get("source_event_id") != execution_scope.latest_event_id:
                 return "Use the latest Matrix request event"
-            if tool_name in MATRIX_MANAGEMENT_TOOLS and not self._operator_scope(execution_scope):
+            if (tool_name in MATRIX_MANAGEMENT_TOOLS and not self._operator_scope(execution_scope)
+                    and not self.ai_controls(tool_name, parameters, execution_scope)):
                 return "Management requires an operator request in the control room"
             if tool_name in MATRIX_ROOM_ADMIN_TOOLS | {"manage_matrix_room"} and parameters.get("room_id") not in self.managed_room_ids:
                 return "Choose a configured managed room"
+            if (self.ai_controls(tool_name, parameters, execution_scope)
+                    and tool_name in MATRIX_ROOM_ADMIN_TOOLS | {"manage_matrix_room"}
+                    and execution_scope.channel_id != self.control_room_id
+                    and parameters.get("room_id") != execution_scope.channel_id):
+                return "Use the current managed Matrix room"
             return None
         if tool_name in STATE_TOOLS:
             if not self._watch_scope(execution_scope):

@@ -113,6 +113,8 @@ class TraditionalProcessor:
                     "role": "RATi manages this Matrix community. Use the tools available for this request and report their results in plain English.",
                 }
             
+            payload["community_control"] = self.capability_policy.control_context(execution_scope)
+
             # Generate a cycle ID for this decision
             cycle_id = payload.get("cycle_id", f"cycle_{int(time.time() * 1000)}")
             
@@ -370,6 +372,8 @@ class MainOrchestrator:
             approved_discord_channel_ids=settings.DISCORD_ALLOWED_CHANNEL_IDS.split(","),
             discord_owner_user_ids=settings.DISCORD_OWNER_USER_IDS.split(","),
             discord_admin_enabled=settings.DISCORD_ADMIN_ENABLED,
+            ai_control_enabled=settings.AI_CHAT_CONTROL_ENABLED,
+            ai_moderation_enabled=settings.AI_CHAT_MODERATION_ENABLED,
         )
         
         # Core components

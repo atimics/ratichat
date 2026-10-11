@@ -48,6 +48,8 @@ class AppConfig(BaseSettings):
     AI_MULTIMODAL_MODEL: str = "openai/gpt-4o"  # Model for image/video analysis
     OPENROUTER_API_KEY: Optional[str] = None  # Made optional for demo mode
     BOT_CAPABILITY_PROFILE: str = "public"
+    AI_CHAT_CONTROL_ENABLED: bool = False
+    AI_CHAT_MODERATION_ENABLED: bool = False
     LOG_LEVEL: str = "INFO"
     
     # Web Search and Research

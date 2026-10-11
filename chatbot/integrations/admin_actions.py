@@ -71,3 +71,12 @@ def result_message(data):
     if len(message) > 1800:
         return message[:1700] + "… Choose a smaller page limit for more detail."
     return message
+
+
+def check_ai_control(config, tool, params):
+    if not config.AI_CHAT_CONTROL_ENABLED:
+        raise ValueError("Enable AI chat control for autonomous actions")
+    moderation = (tool in {"moderate_matrix_member", "moderate_discord_member", "manage_discord_role"}
+                  or params.get("operation") in {"delete", "redact"})
+    if moderation and not config.AI_CHAT_MODERATION_ENABLED:
+        raise ValueError("Use an owner request for this moderation action")
