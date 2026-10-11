@@ -108,6 +108,9 @@ class AwarenessStore:
                 target_platform TEXT, target_account TEXT, target_actor TEXT, token_hash TEXT,
                 stage TEXT, expires_at REAL, created_at REAL);
         """)
+        columns = {row["name"] for row in self._db.execute("PRAGMA table_info(awareness_nodes)")}
+        if "summary_checked_at" not in columns:
+            self._db.execute("ALTER TABLE awareness_nodes ADD COLUMN summary_checked_at REAL")
 
     @contextmanager
     def _transaction(self):
@@ -180,7 +183,12 @@ class AwarenessStore:
     @staticmethod
     def _node(row):
         data = json.loads(row["data_json"])
-        summary = row["summary"]
+        summary = row["summary"] if row["summary_version"] == row["version"] and row["summary_checked_at"] is not None else ""
+        result = data.get("result") if isinstance(data, dict) else None
+        if row["kind"] == "task" and isinstance(result, dict) and result.get("kind") == "worker" and result.get("review_status") != "source_checked":
+            data["result"] = {"kind": "worker", "review_status": "needs_review"}
+            summary = ""
+        summary_checked_at = row["summary_checked_at"] if summary else row["updated_at"]
         if not summary:
             if row["kind"] == "conversation" and isinstance(data, dict):
                 summary = "; ".join(str(item.get("content", ""))[:180] for item in data.get("messages", [])[-3:])
@@ -190,7 +198,8 @@ class AwarenessStore:
                 summary = json.dumps(data, ensure_ascii=False)[:700]
             summary = " ".join(summary.split())[:700]
         return {"kind": row["kind"], "data": data, "summary": summary,
-                "version": row["version"], "summary_version": row["summary_version"] or row["version"], "valid": bool(row["valid"]),
+                "version": row["version"], "summary_version": row["version"], "valid": bool(row["valid"]),
+                "summary_checked_at": summary_checked_at,
                 "audience": {"kind": row["audience_kind"], "key": row["audience_key"]},
                 "evidence": json.loads(row["evidence_json"]), "updated_at": row["updated_at"]}
 
@@ -364,8 +373,8 @@ class AwarenessStore:
 
     def publish_summary(self, node_id, content_version, summary):
         with self._transaction() as db:
-            updated = db.execute("UPDATE awareness_nodes SET summary=?,summary_version=? WHERE id=? AND version=? AND valid=1",
-                                 (str(summary)[:1200], content_version, node_id, content_version))
+            updated = db.execute("UPDATE awareness_nodes SET summary=?,summary_version=?,summary_checked_at=? WHERE id=? AND version=? AND valid=1",
+                                 (str(summary)[:1200], content_version, self.clock(), node_id, content_version))
             return {"updated": bool(updated.rowcount), "conflict": not bool(updated.rowcount)}
 
     def snapshot_versions(self, platform, channel_id, sender_id, nodes, *, event_id=None):
@@ -413,6 +422,14 @@ class AwarenessStore:
                 if len(json.dumps(candidate, ensure_ascii=False)) <= max_chars:
                     catalog = candidate
             return catalog
+
+    def get_node(self, node_id, platform, channel_id, sender_id):
+        """Read one current node within the caller's audience."""
+        platform, channel_id, sender_id = self._scope(platform, channel_id, sender_id)
+        with self._transaction() as db:
+            actor = self._actor(db, platform, sender_id)
+            row = db.execute("SELECT * FROM awareness_nodes WHERE id=? AND valid=1", (node_id,)).fetchone()
+            return self._node(row) if row and self._can_read(db, row, platform, channel_id, actor) else None
 
     def load_view(self, view_id, platform, channel_id, sender_id):
         platform, channel_id, sender_id = self._scope(platform, channel_id, sender_id)
@@ -636,6 +653,12 @@ class AwarenessStore:
                  str(route.get("persona", task["persona_id"]))[:100], self.clock(), task_id))
             self._task_node(db, task_id)
             return {"saved": True, "conflict": False, "id": identity, "route": route}
+
+    def inputs_current(self, task_id, versions=None):
+        """Check saved source versions before a task acts or delivers a reply."""
+        with self._transaction() as db:
+            task = db.execute("SELECT * FROM awareness_tasks WHERE id=?", (task_id,)).fetchone()
+            return bool(task and self._versions(db, versions if versions is not None else json.loads(task["input_json"]), task))
 
     @staticmethod
     def _chain(db, task_id):

@@ -332,6 +332,7 @@ class PayloadBuilder:
     def build_request_node_payload(self, channel, node_manager, source_nodes=None):
         """Build a node view from one trusted chat channel and its fetched sources."""
         from ...config import settings
+        from ..node_system.evidence import summary_record
 
         messages = [
             {"id": message.id, "sender_id": message.sender,
@@ -352,10 +353,11 @@ class PayloadBuilder:
         expanded, collapsed = {}, {}
         for path, data in catalog.items():
             metadata = node_manager.get_node_metadata(path)
+            summary = summary_record(path, data, node_manager)
             if metadata.is_expanded:
                 expanded[path] = {"data": data, "is_pinned": metadata.is_pinned}
             else:
-                collapsed[path] = {"summary": metadata.ai_summary or data.get("description", f"Fetched source {path}")}
+                collapsed[path] = summary
         return {
             "processing_mode": "node_based",
             "current_processing_channel_id": channel.id,
