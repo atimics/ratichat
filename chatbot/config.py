@@ -48,6 +48,8 @@ class AppConfig(BaseSettings):
     AI_MULTIMODAL_MODEL: str = "openai/gpt-4o"  # Model for image/video analysis
     OPENROUTER_API_KEY: Optional[str] = None  # Made optional for demo mode
     BOT_CAPABILITY_PROFILE: str = "public"
+    AI_CHAT_CONTROL_ENABLED: bool = False
+    AI_CHAT_MODERATION_ENABLED: bool = False
     LOG_LEVEL: str = "INFO"
     
     # Web Search and Research
@@ -79,6 +81,8 @@ class AppConfig(BaseSettings):
     DISCORD_MESSAGE_RATE_LIMIT_PER_MINUTE: int = 10
     DISCORD_MAX_MESSAGE_CHARS: int = 4000
     DISCORD_OWNER_USER_IDS: str = ""
+    DISCORD_ADMIN_ENABLED: bool = False
+    DISCORD_MANAGED_ROLE_IDS: str = ""
     SHARED_AWARENESS_ENABLED: bool = True
     TASK_MODEL_ROUTING_ENABLED: bool = True
     TASK_BUDGET_USD: float = 0.10

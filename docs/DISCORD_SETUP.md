@@ -57,3 +57,10 @@ The public and Matrix steward profiles support Discord replies. Discord
 requests use the Discord reply tool and the current channel's messages. Bot
 and webhook messages are skipped. Replies use the source message as their
 reference and keep mentions quiet.
+
+## AI community tools
+
+For channel settings, member moderation, role assignment, and message pins,
+follow the [AI chat tool setup](AI_CHAT_TOOLS.md). Enable `AI_CHAT_CONTROL_ENABLED`
+and grant the bot permissions for the actions it should choose. Configure owner
+IDs for owner requests and protected accounts.

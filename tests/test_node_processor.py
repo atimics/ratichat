@@ -542,3 +542,64 @@ async def test_short_watch_text_uses_normal_agent_processing(tmp_path):
     assert turn["kind"] == "request"
     await processor.process_cycle("agent", "20")
     ai.make_decision.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["manage_discord_channel", "moderate_discord_member", "manage_discord_role", "manage_discord_message", "inspect_discord_server"])
+async def test_discord_admin_node_turn_uses_actual_result_and_current_channel(tmp_path, tool_name):
+    processor, ai, tools = make_processor(tmp_path, [decision(
+        plan("send_discord_reply", channel_id="20", reply_to_id="40", content="guessed success"),
+        plan(tool_name, source_event_id="40", operation="topic", value="Welcome"),
+    )])
+    processor.policy = CapabilityPolicy("public", approved_discord_channel_ids=["20"],
+                                       discord_owner_user_ids=["50"], discord_admin_enabled=True)
+    processor.executor.capability_policy = processor.policy
+    admin = SimpleNamespace(name=tool_name, description="Admin tool", parameters_schema={}, execute=AsyncMock(
+        return_value={"status": "success", "message": "Actual admin result", "receipt_id": "receipt123456789"}))
+    processor.executor.tool_registry.register_tool(admin)
+    result = await processor.process_cycle("admin", "20")
+    assert not result["failed"]
+    admin.execute.assert_awaited_once()
+    context = admin.execute.await_args.args[1]
+    assert context.execution_scope.latest_sender_id == "50"
+    reply = tools["send_discord_reply"].execute.await_args.args[0]
+    assert reply["content"] == "Actual admin result\n\nReceipt: receipt12345"
+    assert reply["channel_id"] == "20" and reply["reply_to_id"] == "40"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [None, {"processing_mode": "traditional"}])
+async def test_ai_control_reads_changes_checks_and_replies(tmp_path, mode):
+    processor, ai, tools = make_processor(tmp_path, [
+        decision(plan("inspect_discord_server", source_event_id="40")),
+        decision(plan("manage_discord_channel", source_event_id="40", operation="slowmode", seconds=30, reason="Busy event")),
+        decision(plan("inspect_discord_server", source_event_id="40")),
+        decision(plan("wait")),
+    ])
+    processor.policy = CapabilityPolicy("matrix_steward", approved_discord_channel_ids=["20"], ai_control_enabled=True)
+    processor.executor.capability_policy = processor.policy
+    inspect_tool = SimpleNamespace(name="inspect_discord_server", description="Inspect", parameters_schema={}, execute=AsyncMock(side_effect=[
+        {"status": "success", "slowmode_seconds": 0}, {"status": "success", "slowmode_seconds": 30}]))
+    change_tool = SimpleNamespace(name="manage_discord_channel", description="Manage", parameters_schema={}, execute=AsyncMock(
+        return_value={"status": "success", "message": "Slowmode changed", "receipt_id": "change-receipt"}))
+    processor.executor.tool_registry.register_tool(inspect_tool)
+    processor.executor.tool_registry.register_tool(change_tool)
+    ai.compose_reply.return_value = "I set slowmode to 30 seconds. Receipt: change-receipt"
+    payloads = []
+    original = ai.make_decision.side_effect
+    async def capture(payload, cycle):
+        payloads.append(copy.deepcopy(payload))
+        return next(original)
+    ai.make_decision.side_effect = capture
+    result = await processor.process_cycle("ai-control", "20", mode)
+    assert not result["failed"]
+    assert inspect_tool.execute.await_count == 2
+    change_tool.execute.assert_awaited_once()
+    assert "slowmode_seconds" in json.dumps(payloads[1])
+    assert "change-receipt" in json.dumps(payloads[2])
+    assert "manage_discord_channel" not in payloads[2]["available_tools"]
+    assert "slowmode_seconds\": 30" in json.dumps(payloads[3])
+    assert payloads[0]["community_control"]["mode"] == "ai"
+    assert tools["send_discord_reply"].execute.await_args.args[0]["content"] == ai.compose_reply.return_value
+    assert (await processor.process_cycle("again", "20"))["duplicate"]
+    change_tool.execute.assert_awaited_once()

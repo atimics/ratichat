@@ -33,7 +33,7 @@ from ..world_state.payload_builder import PayloadBuilder
 from .processing_hub import ProcessingHub, ProcessingConfig
 from .rate_limiter import RateLimiter, RateLimitConfig
 from ..proactive import ProactiveConversationEngine
-from .capability_policy import CapabilityPolicy, ExecutionScope, STATE_TOOLS
+from .capability_policy import CapabilityPolicy, ExecutionScope, STATE_TOOLS, MANAGEMENT_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +113,8 @@ class TraditionalProcessor:
                     "role": "RATi manages this Matrix community. Use the tools available for this request and report their results in plain English.",
                 }
             
+            payload["community_control"] = self.capability_policy.control_context(execution_scope)
+
             # Generate a cycle ID for this decision
             cycle_id = payload.get("cycle_id", f"cycle_{int(time.time() * 1000)}")
             
@@ -125,14 +127,11 @@ class TraditionalProcessor:
                 
             # Management actions produce their own factual reply after execution.
             actions = decision_result.selected_actions
-            if self.capability_policy.profile == "matrix_steward":
-                management = [action for action in actions if action.action_type in {
-                    "manage_matrix_room", "manage_matrix_server", "matrix_server_status",
-                }]
-                actions = management[:1] if management else actions
+            management = [action for action in actions if action.action_type in MANAGEMENT_TOOLS]
+            actions = management[:1] if management else actions
             for action in actions:
                 try:
-                    if action.action_type in {"manage_matrix_room", "manage_matrix_server", "matrix_server_status"}:
+                    if action.action_type in MANAGEMENT_TOOLS:
                         result = await self._execute_action_and_return_result(action, execution_scope)
                         if result.get("status") != "blocked":
                             # Send the actual result as the reply, then finish this
@@ -141,12 +140,13 @@ class TraditionalProcessor:
                             message = result.get("message", str(result))
                             if receipt:
                                 message += "\n\nReceipt: " + receipt[:12]
-                            reply = ActionPlan("send_matrix_reply", {
+                            reply_tool = "send_discord_reply" if execution_scope.channel_type == "discord" else "send_matrix_reply"
+                            reply = ActionPlan(reply_tool, {
                                 "channel_id": execution_scope.channel_id,
                                 "reply_to_id": execution_scope.latest_event_id,
                                 "content": message,
                                 "format_as_markdown": False,
-                            }, "Report the Matrix action result", 1)
+                            }, "Report the admin action result", 1)
                             await self._execute_action(reply, execution_scope)
                         break
                     await self._execute_action(action, execution_scope)
@@ -206,10 +206,11 @@ class TraditionalProcessor:
             )
 
     def _tool_context(self, tool_name, execution_scope):
-        if tool_name not in STATE_TOOLS:
+        if tool_name not in STATE_TOOLS | MANAGEMENT_TOOLS:
             return self.action_context
         context = copy(self.action_context)
         context.execution_scope = execution_scope
+        context.capability_policy = self.capability_policy
         return context
 
     async def _record_blocked_action(
@@ -370,6 +371,9 @@ class MainOrchestrator:
             managed_room_ids=settings.MATRIX_MANAGED_ROOM_IDS.split(","),
             approved_discord_channel_ids=settings.DISCORD_ALLOWED_CHANNEL_IDS.split(","),
             discord_owner_user_ids=settings.DISCORD_OWNER_USER_IDS.split(","),
+            discord_admin_enabled=settings.DISCORD_ADMIN_ENABLED,
+            ai_control_enabled=settings.AI_CHAT_CONTROL_ENABLED,
+            ai_moderation_enabled=settings.AI_CHAT_MODERATION_ENABLED,
         )
         
         # Core components
@@ -472,6 +476,10 @@ class MainOrchestrator:
         from ...integrations.matrix.steward import MatrixSteward
         self.matrix_steward = MatrixSteward(settings, self.config.db_path)
         self.action_context.matrix_steward = self.matrix_steward
+        from ...integrations.matrix.admin import MatrixRoomAdmin
+        from ...integrations.discord.admin import DiscordAdmin
+        self.action_context.matrix_admin = MatrixRoomAdmin(self.matrix_steward)
+        self.action_context.discord_admin = DiscordAdmin(settings, self.config.db_path)
         self.steward_task = None
         self.source_watch_service = None
         self.source_watch_task = None
@@ -575,6 +583,9 @@ class MainOrchestrator:
         from ...tools.matrix_management_tools import MatrixServerStatusTool, ManageMatrixRoomTool, ManageMatrixServerTool
         for tool in (MatrixServerStatusTool(), ManageMatrixRoomTool(), ManageMatrixServerTool()):
             self.tool_registry.register_tool(tool)
+        from ...tools.chat_admin_tools import CHAT_ADMIN_TOOL_CLASSES
+        for tool_class in CHAT_ADMIN_TOOL_CLASSES:
+            self.tool_registry.register_tool(tool_class())
         self.tool_registry.register_tool(DescribeImageTool())
         
         # Web search and research tools
