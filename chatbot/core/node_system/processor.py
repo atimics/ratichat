@@ -11,7 +11,7 @@ import time
 
 from ...config import settings
 from ..ai_engine import ActionPlan
-from ..orchestration.capability_policy import READ_ONLY_SOURCE_TOOLS, SOURCE_WATCH_TOOLS, PROACTIVE_SOURCE_TOOLS, STATE_TOOLS, TASK_TOOLS
+from ..orchestration.capability_policy import READ_ONLY_SOURCE_TOOLS, SOURCE_WATCH_TOOLS, PROACTIVE_SOURCE_TOOLS, STATE_TOOLS, TASK_TOOLS, MANAGEMENT_TOOLS, MANAGEMENT_WRITE_TOOLS
 from .interaction_tools import NodeInteractionTools
 from .node_manager import NodeManager
 from .research_store import ResearchStore
@@ -20,7 +20,6 @@ from ..world_state.structures import Channel, Message
 
 logger = logging.getLogger(__name__)
 NODE_TOOLS = frozenset({"expand_node", "collapse_node", "pin_node", "unpin_node", "get_expansion_status"})
-MANAGEMENT_TOOLS = frozenset({"manage_matrix_room", "manage_matrix_server", "matrix_server_status"})
 REPLY_TOOLS = frozenset({"send_discord_reply", "send_matrix_reply", "send_farcaster_reply"})
 STATE_RESULT_PREFIXES = ("sources.watch_result_", "sources.proactive_result_", "sources.task_result_")
 
@@ -580,9 +579,8 @@ class NodeProcessor:
                         results.append({"tool": action.action_type, "node_path": path, "status": result.get("status")})
                         executed += 1
                     continue
-                if self.policy.profile == "matrix_steward":
-                    management = [action for action in actions if action.action_type in MANAGEMENT_TOOLS]
-                    actions = management[:1] if management else actions
+                management = [action for action in actions if action.action_type in MANAGEMENT_TOOLS]
+                actions = management[:1] if management else actions
                 for action in actions[:1]:
                     if action.action_type not in names:
                         continue
@@ -592,17 +590,18 @@ class NodeProcessor:
                     if turn and action.action_type in REPLY_TOOLS:
                         result = await self._save_and_send(action, scope, turn, sources)
                     else:
-                        if turn and action.action_type in {"manage_matrix_room", "manage_matrix_server"}:
+                        if turn and action.action_type in MANAGEMENT_WRITE_TOOLS:
                             if self.policy.denial_reason(action.action_type, action.parameters, scope) is None:
                                 if not self.research_store.mark_effect(turn["id"], turn["lease_token"]):
                                     return self._result(executed, lookups, step + 1, failed=True)
                         result = await self.executor._execute_action_and_return_result(action, scope)
                     executed += 1
                     if action.action_type in MANAGEMENT_TOOLS:
-                        content = result.get("message", result.get("error", "Matrix action finished"))
+                        content = result.get("message", result.get("error", "Admin action finished"))
                         if result.get("receipt_id"):
                             content += "\n\nReceipt: " + result["receipt_id"][:12]
-                        reply = ActionPlan("send_matrix_reply", {
+                        reply_tool = "send_discord_reply" if scope.channel_type == "discord" else "send_matrix_reply"
+                        reply = ActionPlan(reply_tool, {
                             "channel_id": scope.channel_id, "reply_to_id": scope.latest_event_id,
                             "content": content, "format_as_markdown": False,
                         }, "Report the actual result", 1)

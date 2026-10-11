@@ -57,3 +57,9 @@ The public and Matrix steward profiles support Discord replies. Discord
 requests use the Discord reply tool and the current channel's messages. Bot
 and webhook messages are skipped. Replies use the source message as their
 reference and keep mentions quiet.
+
+## Admin tools
+
+For channel settings, member moderation, role assignment, and message pins,
+follow the [chat admin tool setup](CHAT_ADMIN_TOOLS.md). Configure the owner IDs,
+enable `DISCORD_ADMIN_ENABLED`, and grant the permissions for the actions you use.

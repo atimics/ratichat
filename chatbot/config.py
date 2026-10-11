@@ -79,6 +79,8 @@ class AppConfig(BaseSettings):
     DISCORD_MESSAGE_RATE_LIMIT_PER_MINUTE: int = 10
     DISCORD_MAX_MESSAGE_CHARS: int = 4000
     DISCORD_OWNER_USER_IDS: str = ""
+    DISCORD_ADMIN_ENABLED: bool = False
+    DISCORD_MANAGED_ROLE_IDS: str = ""
     SHARED_AWARENESS_ENABLED: bool = True
     TASK_MODEL_ROUTING_ENABLED: bool = True
     TASK_BUDGET_USD: float = 0.10

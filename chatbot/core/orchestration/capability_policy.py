@@ -29,7 +29,12 @@ PUBLIC_BOT_BLOCKED_PARAMETERS = {
     "send_matrix_reply": frozenset({"image_url"}),
 }
 
-MATRIX_MANAGEMENT_TOOLS = frozenset({"manage_matrix_room", "manage_matrix_server"})
+MATRIX_ROOM_ADMIN_TOOLS = frozenset({"inspect_matrix_room", "moderate_matrix_member", "manage_matrix_message"})
+DISCORD_ADMIN_TOOLS = frozenset({"inspect_discord_server", "manage_discord_channel", "moderate_discord_member", "manage_discord_role", "manage_discord_message"})
+ADMIN_READ_TOOLS = frozenset({"inspect_matrix_room", "inspect_discord_server"})
+MATRIX_MANAGEMENT_TOOLS = frozenset({"manage_matrix_room", "manage_matrix_server"}) | MATRIX_ROOM_ADMIN_TOOLS
+MANAGEMENT_TOOLS = MATRIX_MANAGEMENT_TOOLS | DISCORD_ADMIN_TOOLS | {"matrix_server_status"}
+MANAGEMENT_WRITE_TOOLS = MANAGEMENT_TOOLS - ADMIN_READ_TOOLS - {"matrix_server_status"}
 MATRIX_STEWARD_TOOLS = PUBLIC_BOT_ALLOWED_TOOLS | MATRIX_MANAGEMENT_TOOLS | {"matrix_server_status"}
 
 
@@ -58,6 +63,7 @@ class CapabilityPolicy:
         managed_room_ids: Collection[str] = (),
         approved_discord_channel_ids: Collection[str] = (),
         discord_owner_user_ids: Collection[str] = (),
+        discord_admin_enabled: bool = False,
     ) -> None:
         normalized_profile = profile.strip().lower()
         if normalized_profile not in self.SUPPORTED_PROFILES:
@@ -66,6 +72,7 @@ class CapabilityPolicy:
                 f"Unknown bot capability profile '{profile}'. Supported profiles: {supported}"
             )
         self.profile = normalized_profile
+        self.discord_admin_enabled = discord_admin_enabled
         self.approved_discord_channel_ids = frozenset(
             value.strip() for value in approved_discord_channel_ids if value.strip()
         )
@@ -81,6 +88,8 @@ class CapabilityPolicy:
 
     def allows(self, tool_name: str) -> bool:
         """Return whether this profile permits a model-selected tool."""
+        if tool_name in DISCORD_ADMIN_TOOLS:
+            return self.discord_admin_enabled
         if self.profile == "operator":
             return True
         if self.profile == "matrix_steward":
@@ -90,14 +99,14 @@ class CapabilityPolicy:
     def filter_tool_names(self, tool_names: Collection[str], execution_scope=None) -> set[str]:
         """Return the names that may be shown to and used by the model."""
         if execution_scope and execution_scope.channel_type == "discord":
-            tool_names = set(tool_names) & ({"wait", "send_discord_reply"} | READ_ONLY_SOURCE_TOOLS | STATE_TOOLS)
+            tool_names = set(tool_names) & ({"wait", "send_discord_reply"} | READ_ONLY_SOURCE_TOOLS | STATE_TOOLS | DISCORD_ADMIN_TOOLS)
         return {
             name for name in tool_names
             if self.allows(name) and (
-                self.profile != "matrix_steward"
-                or name not in MATRIX_MANAGEMENT_TOOLS
+                name not in MATRIX_MANAGEMENT_TOOLS
                 or self._operator_scope(execution_scope)
-            ) and (name not in STATE_TOOLS or self._watch_scope(execution_scope))
+            ) and (name not in DISCORD_ADMIN_TOOLS or self._discord_admin_scope(execution_scope))
+            and (name not in STATE_TOOLS or self._watch_scope(execution_scope))
             and (name not in PROACTIVE_SOURCE_TOOLS or execution_scope.channel_type == "discord")
             and (name not in WATCH_WRITE_TOOLS | PROACTIVE_WRITE_TOOLS or self._watch_owner_scope(execution_scope))
         }
@@ -114,12 +123,18 @@ class CapabilityPolicy:
         owners = self.discord_owner_user_ids if scope.channel_type == "discord" else self.operator_user_ids
         return scope.latest_sender_id in owners
 
+    def _discord_admin_scope(self, scope):
+        return bool(self.discord_admin_enabled and scope and scope.channel_type == "discord"
+                    and self._watch_owner_scope(scope))
+
     def _operator_scope(self, scope: ExecutionScope | None) -> bool:
         return bool(
             scope and scope.channel_type == "matrix"
             and self.control_room_id
             and scope.channel_id == self.control_room_id
             and scope.latest_sender_id in self.operator_user_ids
+            and scope.latest_event_id
+            and scope.channel_id in self.approved_matrix_room_ids
         )
 
     def scope_from_payload(self, payload: Mapping[str, Any]) -> ExecutionScope:
@@ -170,6 +185,26 @@ class CapabilityPolicy:
                 f"Tool '{tool_name}' is blocked by the "
                 f"'{self.profile}' capability profile"
             )
+        if tool_name in DISCORD_ADMIN_TOOLS:
+            if not self._discord_admin_scope(execution_scope):
+                return "Use a current Discord owner request in a configured channel"
+            if parameters.get("source_event_id") != execution_scope.latest_event_id:
+                return "Use the latest Discord owner request message ID"
+            if set(parameters) & {"channel_id", "guild_id", "sender_id", "is_owner"}:
+                return "Use the channel, server, and owner from the current request"
+            return None
+        if tool_name in MATRIX_MANAGEMENT_TOOLS | {"matrix_server_status"}:
+            if not execution_scope or execution_scope.channel_type != "matrix":
+                return "A current Matrix request is required"
+            if execution_scope.channel_id not in self.approved_matrix_room_ids:
+                return "Use an approved Matrix room"
+            if not execution_scope.latest_event_id or parameters.get("source_event_id") != execution_scope.latest_event_id:
+                return "Use the latest Matrix request event"
+            if tool_name in MATRIX_MANAGEMENT_TOOLS and not self._operator_scope(execution_scope):
+                return "Management requires an operator request in the control room"
+            if tool_name in MATRIX_ROOM_ADMIN_TOOLS | {"manage_matrix_room"} and parameters.get("room_id") not in self.managed_room_ids:
+                return "Choose a configured managed room"
+            return None
         if tool_name in STATE_TOOLS:
             if not self._watch_scope(execution_scope):
                 return "Use a current request in a configured Discord or Matrix channel"
@@ -202,19 +237,6 @@ class CapabilityPolicy:
                 return "Reply to the latest Discord mention"
             return None
         if self.profile == "operator":
-            return None
-
-        if tool_name in MATRIX_MANAGEMENT_TOOLS | {"matrix_server_status"}:
-            if not execution_scope or execution_scope.channel_type != "matrix":
-                return "A current Matrix request is required"
-            if execution_scope.channel_id not in self.approved_matrix_room_ids:
-                return "Use an approved Matrix room"
-            if not execution_scope.latest_event_id or parameters.get("source_event_id") != execution_scope.latest_event_id:
-                return "Use the latest Matrix request event"
-            if tool_name in MATRIX_MANAGEMENT_TOOLS and not self._operator_scope(execution_scope):
-                return "Management requires an operator request in the control room"
-            if tool_name == "manage_matrix_room" and parameters.get("room_id") not in self.managed_room_ids:
-                return "Choose a configured managed room"
             return None
 
         blocked_parameters = PUBLIC_BOT_BLOCKED_PARAMETERS.get(tool_name, frozenset())
