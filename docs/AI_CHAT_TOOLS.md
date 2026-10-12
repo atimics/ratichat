@@ -23,9 +23,12 @@ With `AI_CHAT_MODERATION_ENABLED=false`, room names, topics, slowmode, pins,
 inspection, and the existing Matrix server tools are available to the AI.
 Member changes, role changes, and message removal use explicit owner requests.
 Set `AI_CHAT_MODERATION_ENABLED=true` to let the AI choose those actions too.
-Discord role assignment still uses the configured managed role IDs.
+Discord role assignment uses `DISCORD_MANAGED_ROLE_IDS`.
 
-The Fly config enables AI control with moderation through owner requests.
+The Fly config enables AI control of moderation and role changes. RATi can
+choose kicks, bans, timeouts, role assignments, and message removal using the
+bot's platform permissions. It sets `DISCORD_MANAGED_ROLE_IDS=*` so RATi can
+assign editable community roles below its own role, including future roles.
 The AI receives its mode, current source event, current channel, and managed
 Matrix room IDs in `community_control`. Tool results return to the model before
 its next decision. Each observed event allows one change. Its receipt stays in
@@ -101,7 +104,9 @@ from member changes.
 | `manage_discord_message` | Pin or unpin in the current channel | Pin Messages |
 | `manage_discord_message` | Delete one message in the current channel | Manage Messages |
 
-Role changes use `DISCORD_MANAGED_ROLE_IDS`. Both the selected role and member
+Role changes use `DISCORD_MANAGED_ROLE_IDS`: supply role IDs separated by commas,
+or `*` for all editable community roles. An empty value keeps role assignment
+awaiting setup. Both the selected role and member
 must sit below the bot's highest role. In the owner request flow, they must also
 sit below the requester's highest role. Discord's server owner uses owner
 authority. Editable roles must fit within the acting account's permissions. A ban preserves existing messages. Timeouts accept 1 second through

@@ -145,7 +145,7 @@ class DiscordAdmin:
         self.require_permission(actor, bot, "manage_roles")
         role_id = snowflake(params.get("role_id"), "role")
         allowed_roles = {value.strip() for value in self.config.DISCORD_MANAGED_ROLE_IDS.split(",") if value.strip()}
-        if str(role_id) not in allowed_roles:
+        if "*" not in allowed_roles and str(role_id) not in allowed_roles:
             raise ValueError("Choose a configured managed Discord role")
         roles = await guild.fetch_roles()
         role = next((item for item in roles if item.id == role_id), None)
