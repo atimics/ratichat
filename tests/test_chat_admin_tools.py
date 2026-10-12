@@ -255,9 +255,14 @@ async def test_discord_moderation(discord_admin, operation):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["add", "remove"])
-async def test_discord_role_actions(discord_admin, operation):
+@pytest.mark.parametrize("role_config", ["80", "*"])
+@pytest.mark.parametrize("autonomous", [False, True])
+async def test_discord_role_actions(discord_admin, operation, role_config, autonomous):
     d = discord_admin
-    result = await d.admin.execute("manage_discord_role", discord_params(operation=operation, user_id="60", role_id="80"), DISCORD_SCOPE, d.observer)
+    d.admin.config.DISCORD_MANAGED_ROLE_IDS = role_config
+    d.admin.config.AI_CHAT_CONTROL_ENABLED = autonomous
+    d.admin.config.AI_CHAT_MODERATION_ENABLED = autonomous
+    result = await d.admin.execute("manage_discord_role", discord_params(operation=operation, user_id="60", role_id="80"), DISCORD_SCOPE, d.observer, autonomous=autonomous)
     assert result["status"] == "success"
     method = d.member.add_roles if operation == "add" else d.member.remove_roles
     assert method.await_args.args == (d.role,)
@@ -310,18 +315,26 @@ async def test_discord_protected_member_ids(discord_admin, user_id):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["member_order", "role_order", "managed", "allowlist", "permissions"])
-async def test_discord_role_constraints(discord_admin, change):
+@pytest.mark.parametrize("role_config", ["80", "*"])
+@pytest.mark.parametrize("autonomous", [False, True])
+@pytest.mark.parametrize("change", ["member_order", "role_order", "managed", "default", "allowlist", "empty", "permissions"])
+async def test_discord_role_constraints(discord_admin, change, role_config, autonomous):
     d = discord_admin
+    d.admin.config.DISCORD_MANAGED_ROLE_IDS = role_config
+    d.admin.config.AI_CHAT_CONTROL_ENABLED = autonomous
+    d.admin.config.AI_CHAT_MODERATION_ENABLED = autonomous
     if change == "member_order": d.member.top_role.position = 20
     if change == "role_order": d.role.position = 20
     if change == "managed": d.role.managed = True
+    if change == "default": d.role.is_default = lambda: True
     if change == "allowlist": d.admin.config.DISCORD_MANAGED_ROLE_IDS = "81"
+    if change == "empty": d.admin.config.DISCORD_MANAGED_ROLE_IDS = ""
     if change == "permissions":
-        d.actor.guild_permissions = discord.Permissions(manage_roles=True)
+        d.actor.guild_permissions = discord.Permissions(view_channel=True, manage_roles=True)
+        d.bot.guild_permissions = discord.Permissions(view_channel=True, manage_roles=True)
         d.role.permissions = discord.Permissions(administrator=True)
     with pytest.raises(ValueError):
-        await d.admin.execute("manage_discord_role", discord_params(operation="add", user_id="60", role_id="80"), DISCORD_SCOPE, d.observer)
+        await d.admin.execute("manage_discord_role", discord_params(operation="add", user_id="60", role_id="80"), DISCORD_SCOPE, d.observer, autonomous=autonomous)
     d.member.add_roles.assert_not_awaited()
 
 
