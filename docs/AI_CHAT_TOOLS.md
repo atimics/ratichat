@@ -25,7 +25,9 @@ Member changes, role changes, and message removal use explicit owner requests.
 Set `AI_CHAT_MODERATION_ENABLED=true` to let the AI choose those actions too.
 Discord role assignment still uses the configured managed role IDs.
 
-The Fly config enables AI control with moderation through owner requests.
+The Fly config enables AI control of moderation and role changes. RATi can
+choose kicks, bans, timeouts, role assignments, and message removal using the
+bot's platform permissions. Discord role assignments use the configured role IDs.
 The AI receives its mode, current source event, current channel, and managed
 Matrix room IDs in `community_control`. Tool results return to the model before
 its next decision. Each observed event allows one change. Its receipt stays in
