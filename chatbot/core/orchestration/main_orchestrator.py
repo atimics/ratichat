@@ -822,6 +822,7 @@ class MainOrchestrator:
         )
         from ..node_system.source_watches import WatchStore, SourceWatchService
         from ..node_system.watch_delivery import WatchDelivery
+        from ..node_system.watch_review import WatchReview
         allowed_channels = {"discord": self.capability_policy.approved_discord_channel_ids,
                             "matrix": self.capability_policy.approved_matrix_room_ids}
         owner_ids = {"discord": {value.strip() for value in settings.DISCORD_OWNER_USER_IDS.split(",") if value.strip()},
@@ -829,6 +830,7 @@ class MainOrchestrator:
         watch_store = WatchStore(self.config.db_path, owner_ids=owner_ids, allowed_channels=allowed_channels)
         delivery = WatchDelivery(self.action_context, allowed_channels)
         self.source_watch_service = SourceWatchService(watch_store, send=delivery.send,
+            review=WatchReview(watch_store, self.ai_engine, self.action_context),
             reconcile=delivery.reconcile, action_context=self.action_context,
             daily_lookup_budget=settings.SOURCE_WATCH_DAILY_LOOKUP_BUDGET)
         self.action_context.source_watch_service = self.source_watch_service
@@ -838,6 +840,7 @@ class MainOrchestrator:
         monitor_store = MonitorStore(self.config.db_path, owner_ids=owner_ids, allowed_channels=allowed_channels)
         self.action_context.onchain_reader = OnchainReader()
         self.live_monitor_service = LiveMonitorService(monitor_store, reader=self.action_context.onchain_reader,
+            review=WatchReview(monitor_store, self.ai_engine, self.action_context),
             send=delivery.send, reconcile=delivery.reconcile,
             daily_lookup_budget=settings.LIVE_MONITOR_DAILY_LOOKUP_BUDGET)
         self.action_context.live_monitor_service = self.live_monitor_service

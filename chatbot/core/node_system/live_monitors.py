@@ -60,7 +60,7 @@ class MonitorStore(WatchStore):
                     db.execute("UPDATE source_watches SET config_json=? WHERE id=?", (json.dumps(config), watch["id"]))
                     watch["config_json"] = json.dumps(config)
                 result = {"status": "success", "created": created, "monitor": public_monitor(watch),
-                          "message": "The monitor is saved. The first successful check saves a quiet baseline. Later checks post new activity and coverage changes here."}
+                          "message": "The monitor is saved. The first successful check saves a quiet baseline. The AI reviews later observations and chooses which developments merit an update here."}
             else:
                 removed = db.execute("DELETE FROM source_watches WHERE id=? AND channel_type=? AND channel_id=? AND kind='chain'",
                     (params["monitor_id"], scope["channel_type"], scope["channel_id"])).rowcount == 1

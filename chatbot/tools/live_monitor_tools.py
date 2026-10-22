@@ -19,7 +19,7 @@ class LiveMonitorTool(SourceWatchTool):
 
 class CreateLiveMonitorTool(LiveMonitorTool):
     name = "create_live_monitor"
-    description = "When the owner asks to watch wallet activity or keep them updated, save a live monitor for these complete addresses. It runs between chats and survives restart. New confirmed transactions and coverage changes are posted in this channel. The first successful check saves a quiet baseline. Confirm the saved ID and interval from the result."
+    description = "When the owner asks to watch wallet activity or keep them updated, save observations for these complete addresses. Checks run between chats and survive restart. The AI considers new transactions and coverage changes alongside the conversation and recent posts, then chooses whether a useful update belongs here. The first successful check saves a quiet baseline. Confirm the saved ID and interval from the result."
     parameters_schema = {"targets": "array of objects with address and network (auto, bitcoin, tron, ethereum, base, arbitrum, optimism, polygon); up to 12",
         "label": "string - Short name for these addresses; default Address activity", "interval_minutes": "integer - Check every 1 to 1440 minutes; default 5"}
 

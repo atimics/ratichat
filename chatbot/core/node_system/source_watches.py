@@ -182,6 +182,9 @@ class WatchStore:
                                       ("check_state", "TEXT NOT NULL DEFAULT '{}'")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE source_watches ADD COLUMN {name} {declaration}")
+            delivery_columns = {row[1] for row in db.execute("PRAGMA table_info(source_watch_deliveries)")}
+            if "review_json" not in delivery_columns:
+                db.execute("ALTER TABLE source_watch_deliveries ADD COLUMN review_json TEXT")
 
     @contextmanager
     def _db(self):
@@ -347,6 +350,47 @@ class WatchStore:
                        (text, json.dumps(keys), delivery_key, now, watch["id"]))
             return dict(db.execute("SELECT * FROM source_watches WHERE id=?", (watch["id"],)).fetchone())
 
+    def saved_review(self, watch):
+        with self._db() as db:
+            row = db.execute("SELECT review_json FROM source_watch_deliveries WHERE delivery_key=?",
+                             (watch["delivery_key"],)).fetchone()
+            return json.loads(row[0]) if row and row[0] else None
+
+    def save_review(self, watch, review):
+        """Save the AI choice before a send, or consume a quiet observation."""
+        if not isinstance(review, dict) or type(review.get("publish")) is not bool:
+            raise ValueError("Supply an AI publishing choice")
+        content = review.get("content")
+        if review["publish"] and (not isinstance(content, str) or not content.strip() or len(content) > 1600):
+            raise ValueError("Supply a short AI update")
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM source_watches WHERE id=? AND delivery_key=? AND lease_token=? AND lease_until>? AND pending_status='pending'",
+                             (watch["id"], watch["delivery_key"], watch["lease_token"], self.now())).fetchone()
+            if row is None:
+                return False
+            db.execute("UPDATE source_watch_deliveries SET review_json=? WHERE delivery_key=?",
+                       (json.dumps(review), watch["delivery_key"]))
+            if review["publish"]:
+                # Evidence links and the stable receipt come from the saved observation.
+                links = list(dict.fromkeys(re.findall(r"\[[^\]]*\]\((https?://[^\s)]+)\)", row["pending_text"])))[:3]
+                text = content.strip().replace("@", "＠")
+                for i, url in enumerate(links):
+                    link = f"\n[Source {i + 1}]({url})"
+                    if len(text) + len(link) < 1850:
+                        text += link
+                text += "\nReceipt: " + watch["delivery_key"][:12]
+                db.execute("UPDATE source_watch_deliveries SET text=? WHERE delivery_key=?", (text, watch["delivery_key"]))
+                db.execute("UPDATE source_watches SET pending_text=? WHERE id=?", (text, watch["id"]))
+                watch["pending_text"] = text
+            else:
+                db.executemany("INSERT OR IGNORE INTO source_watch_items VALUES (?,?)",
+                               [(row["id"], key) for key in json.loads(row["pending_keys"] or "[]")])
+                db.execute("UPDATE source_watch_deliveries SET status='quiet' WHERE delivery_key=?", (watch["delivery_key"],))
+                db.execute("UPDATE source_watches SET pending_text=NULL,pending_keys=NULL,pending_status=NULL,delivery_key=NULL,lease_token=NULL,lease_until=0,next_due=? WHERE id=?",
+                           (self.now() + row["interval_seconds"], row["id"]))
+            return True
+
     def begin_delivery(self, watch):
         with self._db() as db:
             changed = db.execute("UPDATE source_watches SET pending_status='sending' WHERE id=? AND lease_token=? AND lease_until>? AND pending_status='pending'",
@@ -408,7 +452,7 @@ class WatchStore:
 class SourceWatchService:
     """Poll feeds within a daily budget and send saved source-linked updates."""
 
-    def __init__(self, store, fetch=None, send=None, action_context=None, daily_lookup_budget=24, now=time.time, reconcile=None, callback_timeout=30):
+    def __init__(self, store, fetch=None, send=None, action_context=None, daily_lookup_budget=24, now=time.time, reconcile=None, callback_timeout=30, review=None):
         self.store = store
         self.fetch = fetch or self._fetch
         self.send = send
@@ -417,6 +461,7 @@ class SourceWatchService:
         self.now = now
         self.reconcile = reconcile
         self.callback_timeout = callback_timeout
+        self.review = review
         self._tick_lock = asyncio.Lock()
 
     async def _fetch(self, url):
@@ -462,6 +507,23 @@ class SourceWatchService:
         if self.send is None:
             self.store.defer(watch)
             return
+        review = self.store.saved_review(watch)
+        if review is None:
+            try:
+                if self.review is None:
+                    self.store.defer(watch)
+                    return
+                review = await asyncio.wait_for(self.review(watch), timeout=self.callback_timeout)
+                if not self.store.save_review(watch, review):
+                    return
+            except asyncio.CancelledError:
+                self.store.defer(watch)
+                raise
+            except Exception:
+                self.store.defer(watch)
+                return
+        if not review["publish"]:
+            return
         if not self.store.begin_delivery(watch):
             return
         try:
@@ -493,6 +555,10 @@ class SourceWatchService:
                 if not claimed:
                     break
                 watch = claimed[0]
+                # Matrix reconciliation can send. Legacy uncertain deliveries
+                # await review rather than taking this path into a new post.
+                if watch["channel_type"] == "matrix" and self.store.saved_review(watch) is None:
+                    continue
                 try:
                     result = await asyncio.wait_for(self.reconcile(watch["id"], watch["channel_type"], watch["channel_id"], watch["pending_text"], watch["delivery_key"]), timeout=self.callback_timeout)
                 except asyncio.CancelledError:
