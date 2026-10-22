@@ -22,7 +22,7 @@ class SourceWatchTool(ToolInterface):
 
 class CreateSourceWatchTool(SourceWatchTool):
     name = "create_source_watch"
-    description = "Track a public RSS, Atom, or GitHub release feed when the owner asks for updates in this channel. The first check saves a quiet baseline; new entries are posted later."
+    description = "Track a public RSS, Atom, or GitHub release feed when the owner asks for updates in this channel. The first check saves a quiet baseline. Later entries become evidence for the AI to consider with the conversation before choosing a useful post."
     parameters_schema = {
         "url": "string - Public RSS or Atom feed URL",
         "interval_minutes": "integer - Minutes between checks, from 15 to 1440; default 60",

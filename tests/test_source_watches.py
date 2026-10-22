@@ -41,10 +41,14 @@ def make_store(tmp_path, clock):
                       allowed_channels={"discord": {"20", "21"}}, now=clock)
 
 
+async def approve_update(watch):
+    return {"publish": True, "content": watch["pending_text"][:1400], "reason": "Useful update"}
+
+
 def make_service(store, clock, results, send=None, budget=24, reconcile=None):
     fetch = AsyncMock(side_effect=results)
     sender = send or AsyncMock(return_value={"status": "success", "message_id": "sent1"})
-    service = SourceWatchService(store, fetch=fetch, send=sender, daily_lookup_budget=budget, now=clock, reconcile=reconcile)
+    service = SourceWatchService(store, fetch=fetch, send=sender, daily_lookup_budget=budget, now=clock, reconcile=reconcile, review=approve_update)
     return service, fetch, sender
 
 
@@ -677,7 +681,7 @@ async def test_send_failure_or_timeout_holds_receipt_and_runs_other_feeds(tmp_pa
         await asyncio.Event().wait()
     send = AsyncMock(side_effect=blocked if timeout else RuntimeError("Send outcome needs checking"))
     fetch = AsyncMock(side_effect=[feed("v2", "v1"), feed("v1")])
-    service = SourceWatchService(store, fetch=fetch, send=send, now=clock, callback_timeout=0.001)
+    service = SourceWatchService(store, fetch=fetch, send=send, now=clock, callback_timeout=0.001, review=approve_update)
     await service.tick()
     assert store.list(scope("21"))[0]["baseline"] == 1
     assert store.list(scope())[0]["pending_status"] == "unknown"

@@ -25,6 +25,10 @@ ALLOWED = {"discord": ["general"], "matrix": ["!public:test"]}
 OWNERS = {"discord": ["owner"], "matrix": ["@owner:test"]}
 
 
+async def approve_update(watch):
+    return {"publish": True, "content": watch["pending_text"][:1400], "reason": "Useful update"}
+
+
 def store_at(path, clock):
     return MonitorStore(path, owner_ids=OWNERS, allowed_channels=ALLOWED, now=lambda: clock[0])
 
@@ -219,7 +223,7 @@ async def test_baseline_is_quiet_new_activity_is_sent_once_and_survives_restart(
     saved = create(store)
     send = AsyncMock(return_value={"status": "success", "message_id": "posted"})
     reader = SimpleNamespace(check=AsyncMock(side_effect=[snapshot([event(1)]), snapshot([event(2), event(1)])]))
-    service = LiveMonitorService(store, reader, send=send, now=lambda: clock[0], daily_lookup_budget=100)
+    service = LiveMonitorService(store, reader, send=send, now=lambda: clock[0], daily_lookup_budget=100, review=approve_update)
     await service.tick()
     send.assert_not_awaited()
     clock[0] += 301
@@ -243,7 +247,7 @@ async def test_partial_baseline_sends_one_failure_then_recovery_without_old_fund
     create(store)
     send = AsyncMock(return_value={"status": "success", "message_id": "posted"})
     reader = SimpleNamespace(check=AsyncMock(side_effect=[snapshot(status="error"), snapshot(status="error"), snapshot(status="error"), snapshot([event(1)]), snapshot([event(1)])]))
-    service = LiveMonitorService(store, reader, send=send, now=lambda: clock[0], daily_lookup_budget=100)
+    service = LiveMonitorService(store, reader, send=send, now=lambda: clock[0], daily_lookup_budget=100, review=approve_update)
     for _ in range(5):
         await service.tick()
         clock[0] += 301
@@ -260,7 +264,7 @@ async def test_unknown_delivery_reconciles_after_restart_before_more_checks(tmp_
     create(store)
     send = AsyncMock(side_effect=TimeoutError)
     reader = SimpleNamespace(check=AsyncMock(side_effect=[snapshot(), snapshot([event(2)])]))
-    service = LiveMonitorService(store, reader, send=send, now=lambda: clock[0], daily_lookup_budget=100)
+    service = LiveMonitorService(store, reader, send=send, now=lambda: clock[0], daily_lookup_budget=100, review=approve_update)
     await service.tick()
     clock[0] += 301
     await service.tick()

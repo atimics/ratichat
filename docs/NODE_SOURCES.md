@@ -94,8 +94,10 @@ The agent can call `create_source_watch`, `list_source_watches`,
 the sender and channel. Creating and removing watches requires the configured
 owner. The agent reads the actual tool result before it confirms a change.
 Each change and its tool receipt are saved together, so retries keep the same
-result. The first feed check saves a quiet baseline. Later checks post new entries
-with titles, short summaries, and links. Digest reads show the latest saved entries.
+result. The first feed check saves a quiet baseline. Later checks offer new entries
+with titles, short summaries, and links to the AI. It considers the conversation
+and recent posts before choosing whether to publish a useful update. Digest reads
+show the latest saved entries, including observations the AI kept quiet.
 Each update has a receipt and a fixed destination. Saved updates survive restarts.
 
 Set `DISCORD_OWNER_USER_IDS` to the owner's Discord user ID. Matrix watches use
